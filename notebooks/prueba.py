@@ -3,9 +3,12 @@ import numpy as np
 import cv2
 import os
 import glob
+import random
 from sklearn.ensemble import RandomForestClassifier
+from sklearn.model_selection import train_test_split
 from scipy import ndimage as nd
 from matplotlib import pyplot as plt
+from tqdm import tqdm
 
 # ==========================================
 # 0. FUNCIONES DE AYUDA (Lectura y Limpieza)
@@ -105,54 +108,98 @@ def extract_features(img):
     return df, img_gray.shape
 
 # ==========================================
-# 3. ENTRENAMIENTO
+# 3. BÚSQUEDA Y SELECCIÓN DE IMÁGENES
 # ==========================================
-print("\n--- Paso 1: Procesando datos para entrenar ---")
+print("\n--- Buscando imágenes ---")
 
+# Obtener todas las máscaras encontradas
 mask_paths = files_found
+# Derivar las rutas de imágenes desde las máscaras
 img_paths = [f.replace('_mask.tif', '.tif') for f in mask_paths]
 
-target_samples = 50 
+# Crear pares imagen-máscara válidos
+valid_pairs = []
+for img_path, mask_path in zip(img_paths, mask_paths):
+    if os.path.exists(img_path):
+        valid_pairs.append((img_path, mask_path))
+
+print(f"Encontrados {len(valid_pairs)} pares imagen-máscara válidos")
+
+# ==========================================
+# SELECCIÓN ALEATORIA DE 500 IMÁGENES
+# ==========================================
+random.seed(42)  # Para reproducibilidad
+sample_size = min(100, len(valid_pairs))  # 100 o menos si no hay suficientes
+selected_pairs = random.sample(valid_pairs, sample_size)
+
+print(f"Seleccionadas {sample_size} imágenes al azar")
+
+# Separar en listas
+selected_images = [p[0] for p in selected_pairs]
+selected_masks = [p[1] for p in selected_pairs]
+
+# ==========================================
+# SPLIT TRAIN/TEST (80/20)
+# ==========================================
+train_imgs, test_imgs, train_masks, test_masks = train_test_split(
+    selected_images, selected_masks, 
+    test_size=0.2, 
+    random_state=42
+)
+
+print(f"Train: {len(train_imgs)} imágenes | Test: {len(test_imgs)} imágenes")
+
+# ==========================================
+# 4. EXTRACCIÓN DE CARACTERÍSTICAS
+# ==========================================
+print(f"\n--- Extrayendo características de {len(train_imgs)} imágenes de entrenamiento ---")
+
 X_list = []
 Y_list = []
-samples_collected = 0
 
-for i, (img_path, mask_path) in enumerate(zip(img_paths, mask_paths)):
-    if samples_collected >= target_samples: break
-    if not os.path.exists(img_path): continue
-    
+for img_path, mask_path in tqdm(zip(train_imgs, train_masks), total=len(train_imgs), desc="Extrayendo features"):
     img = cv2_imread_unicode(img_path, cv2.IMREAD_COLOR)
     mask = cv2_imread_unicode(mask_path, cv2.IMREAD_GRAYSCALE)
     
-    if img is None or mask is None: continue
-        
-    mask = mask // 255
-    if np.max(mask) == 1: 
-        features, _ = extract_features(img)
-        X_list.append(features)
-        Y_list.append(mask.reshape(-1))
-        samples_collected += 1
-        if samples_collected % 10 == 0:
-            print(f"   -> Procesadas {samples_collected} imágenes...")
+    if img is None or mask is None:
+        continue
+    
+    # Normalizar máscara a 0 y 1
+    mask = mask // 255 
 
-X = pd.concat(X_list)
-Y = np.concatenate(Y_list)
+    # Extraer características de todas las imágenes (con o sin tumor)
+    features, _ = extract_features(img)
+    X_list.append(features)
+    Y_list.append(mask.reshape(-1))
 
-print("--- Paso 2: Entrenando Random Forest... ---")
-model = RandomForestClassifier(n_estimators=10, max_depth=10, n_jobs=-1, random_state=42)
-model.fit(X, Y)
+if len(X_list) == 0:
+    print("Error: No se pudieron cargar imágenes.")
+    exit()
+
+# Concatenar todos los datos
+X_prev = pd.concat(X_list)
+Y_prev = np.concatenate(Y_list)
+
+print(f"Dataset de entrenamiento: {X_prev.shape[0]:,} píxeles, {X_prev.shape[1]} características")
+print(f"Distribución de clases: No Tumor={np.sum(Y_prev==0):,}, Tumor={np.sum(Y_prev==1):,}")
+
+# ==========================================
+# 5. ENTRENAMIENTO DEL MODELO
+# ==========================================
+print("\n--- Entrenando Random Forest... ---")
+model = RandomForestClassifier(n_estimators=50, max_depth=15, n_jobs=-1, random_state=42, class_weight='balanced')
+model.fit(X_prev, Y_prev)
 print("¡Modelo entrenado!")
 
 # ==========================================
-# 4. PRUEBA CON VISUALIZACIÓN MEJORADA
+# 6. PRUEBA CON VISUALIZACIÓN MEJORADA
 # ==========================================
-print("\n--- Paso 3: Probando predicción vs Realidad ---")
+print(f"\n--- Probando predicción en {len(test_imgs)} imágenes de test ---")
 
-idx_prueba = i + 1
-
-if idx_prueba < len(img_paths):
-    test_path = img_paths[idx_prueba]
-    test_mask_path = mask_paths[idx_prueba] 
+# Usar la primera imagen del conjunto de test
+if len(test_imgs) > 0:
+    test_path = test_imgs[0]
+    test_mask_path = test_masks[0]
     
     print(f"Analizando: {os.path.basename(test_path)}")
     
@@ -174,30 +221,30 @@ if idx_prueba < len(img_paths):
         
         imagen_predicha = (matriz_limpia * 255).astype(np.uint8)
 
-        # 4. Visualización (4 Columnas)
-        plt.figure(figsize=(16, 5))
+        # 4. Visualización (2 Filas x 2 Columnas)
+        plt.figure(figsize=(10, 10))
         
-        # Original
-        plt.subplot(1, 4, 1)
+        # Fila 1, Columna 1: Original
+        plt.subplot(2, 2, 1)
         plt.imshow(cv2.cvtColor(img_test, cv2.COLOR_BGR2RGB))
         plt.title("MRI Original")
         plt.axis('off')
         
-        # Realidad
-        plt.subplot(1, 4, 2)
+        # Fila 1, Columna 2: Realidad
+        plt.subplot(2, 2, 2)
         if mask_real is not None:
             plt.imshow(mask_real, cmap='gray')
             plt.title("Realidad (Mask)")
         plt.axis('off')
 
-        # Predicción SUCIA (Con bordes de cráneo)
-        plt.subplot(1, 4, 3)
+        # Fila 2, Columna 1: Predicción SUCIA
+        plt.subplot(2, 2, 3)
         plt.imshow(matriz_raw, cmap='gray')
         plt.title("Predicción (Sin Filtro)")
         plt.axis('off')
         
-        # Predicción LIMPIA (Final)
-        plt.subplot(1, 4, 4)
+        # Fila 2, Columna 2: Predicción LIMPIA
+        plt.subplot(2, 2, 4)
         plt.imshow(imagen_predicha, cmap='gray')
         plt.title("Predicción Final\n(Limpia)")
         plt.axis('off')
@@ -208,4 +255,4 @@ if idx_prueba < len(img_paths):
     else:
         print("No se pudo leer la imagen de prueba.")
 else:
-    print("No quedan imágenes para probar.")
+    print("No hay imágenes de test disponibles.")
