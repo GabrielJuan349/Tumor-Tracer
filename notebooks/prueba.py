@@ -6,9 +6,15 @@ import glob
 import random
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score, confusion_matrix
 from scipy import ndimage as nd
+import matplotlib
+# Configurar backend "Agg" (No interactivo) para evitar errores de hilos/Tcl
+# Esto significa que las imágenes se guardarán pero NO se abrirán ventanas emergentes.
+matplotlib.use('Agg')
 from matplotlib import pyplot as plt
 from tqdm import tqdm
+import time
 
 # ==========================================
 # 0. FUNCIONES DE AYUDA (Lectura y Limpieza)
@@ -101,6 +107,73 @@ def eliminar_cerebelo_y_ruido(img_rgb, prediccion_binaria):
     output = cv2.morphologyEx(output, cv2.MORPH_CLOSE, kernel_clean, iterations=1)
 
     return output
+
+def calcular_metricas(y_true, y_pred):
+    """
+    Calcula métricas enfocadas en el TUMOR, ignorando el fondo masivo (Accuracy Global engañoso).
+    
+    Métricas implementadas:
+    - IoU (Intersection over Union): Acierto real sobre la zona de interés.
+    - Dice Score (F1): Similar a IoU pero da más peso a los aciertos.
+    
+    Lógica para CASOS SIN TUMOR (Mask Vacía):
+    1. Si Mask está vacía y Predicción está vacía -> ÉXITO (IoU = 1.0)
+    2. Si Mask está vacía y Predicción tiene algo -> FALLO (IoU = 0.0, Penalización Falsos Positivos)
+    """
+    # Aplanar arrays para comparar píxel a píxel
+    y_true_flat = y_true.reshape(-1)
+    y_pred_flat = y_pred.reshape(-1)
+    
+    # Calcular componenetes de la matriz de confusión manualmente para control total
+    # TP: Pixel es 1 en ambos
+    tp = np.sum((y_true_flat == 1) & (y_pred_flat == 1))
+    
+    # FP: Pixel es 0 en Realidad pero 1 en Predicción (Alucinación)
+    fp = np.sum((y_true_flat == 0) & (y_pred_flat == 1))
+    
+    # FN: Pixel es 1 en Realidad pero 0 en Predicción (Tumor perdido)
+    fn = np.sum((y_true_flat == 1) & (y_pred_flat == 0))
+    
+    # TN: Pixel es 0 en ambos (Fondo correctamente ignorado) - NO LO USAMOS para métricas tumorales
+    tn = np.sum((y_true_flat == 0) & (y_pred_flat == 0))
+    
+    # CASO ESPECIAL: IMAGEN SIN TUMOR (Ground Truth vacío)
+    if np.sum(y_true_flat) == 0:
+        if np.sum(y_pred_flat) == 0:
+            return {
+                "IoU": 1.0, "Dice": 1.0, "Precision": 1.0, "Recall": 1.0,
+                "TP": 0, "FP": 0, "FN": 0, "TN": tn, "Note": "No Tumor (Correcto)"
+            }
+        else:
+            return {
+                "IoU": 0.0, "Dice": 0.0, "Precision": 0.0, "Recall": 0.0,
+                "TP": 0, "FP": fp, "FN": 0, "TN": tn, "Note": "No Tumor (Falso Positivo!)"
+            }
+
+    # CÁLCULO DE MÉTRICAS (Cuando hay tumor)
+    # IoU = TP / (TP + FP + FN)
+    iou = tp / (tp + fp + fn) if (tp + fp + fn) > 0 else 0.0
+    
+    # Dice (F1) = 2*TP / (2*TP + FP + FN)
+    dice = (2 * tp) / (2 * tp + fp + fn) if (2 * tp + fp + fn) > 0 else 0.0
+    
+    # Precision = TP / (TP + FP)
+    precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+    
+    # Recall = TP / (TP + FN)
+    recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+    
+    return {
+        "IoU": iou,
+        "Dice": dice,
+        "Precision": precision,
+        "Recall": recall,
+        "TP": tp,
+        "FP": fp,
+        "TN": tn,
+        "FN": fn,
+        "Note": "Tumor Presente"
+    }
 
 # ==========================================
 # 1. CONFIGURACIÓN DE RUTAS
@@ -215,7 +288,7 @@ print(f"Encontrados {len(valid_pairs)} pares imagen-máscara válidos")
 # SELECCIÓN ALEATORIA DE 500 IMÁGENES
 # ==========================================
 random.seed(42)  # Para reproducibilidad
-sample_size = min(100, len(valid_pairs))  # 100 o menos si no hay suficientes
+sample_size = min(3929, len(valid_pairs))  # 100 o menos si no hay suficientes
 selected_pairs = random.sample(valid_pairs, sample_size)
 
 print(f"Seleccionadas {sample_size} imágenes al azar")
@@ -238,10 +311,22 @@ print(f"Train: {len(train_imgs)} imágenes | Test: {len(test_imgs)} imágenes")
 # ==========================================
 # 4. EXTRACCIÓN DE CARACTERÍSTICAS
 # ==========================================
+# ==========================================
+# 4. EXTRACCIÓN DE CARACTERÍSTICAS (OPTIMIZADO PARA MEMORIA)
+# ==========================================
 print(f"\n--- Extrayendo características de {len(train_imgs)} imágenes de entrenamiento ---")
 
 X_list = []
 Y_list = []
+
+# Ratio de subsampling para No-Tumor.
+# Guardamos todos los píxeles de tumor y 3 veces esa cantidad de fondo.
+# Esto reduce masivamente el uso de RAM sin perder información crítica.
+RATIO_NO_TUMOR = 3 
+
+print(f"Estrategia de Subsampling: 1 Tumor : {RATIO_NO_TUMOR} No-Tumor")
+
+start_time_extraction = time.time() # START TIMER
 
 for img_path, mask_path in tqdm(zip(train_imgs, train_masks), total=len(train_imgs), desc="Extrayendo features"):
     img = cv2_imread_unicode(img_path, cv2.IMREAD_COLOR)
@@ -252,35 +337,71 @@ for img_path, mask_path in tqdm(zip(train_imgs, train_masks), total=len(train_im
     
     # Normalizar máscara a 0 y 1
     mask = mask // 255 
+    mask_flat = mask.reshape(-1)
 
-    # Extraer características de todas las imágenes (con o sin tumor)
+    # Extraer características
     features, _ = extract_features(img)
-    X_list.append(features)
-    Y_list.append(mask.reshape(-1))
+    
+    # OPTIMIZACIÓN DE MEMORIA: Convertir a float32 inmediatamente
+    features = features.astype(np.float32)
+    
+    # --- SUBSAMPLING INTELIGENTE ---
+    # Identificar índices
+    idx_tumor = np.where(mask_flat == 1)[0]
+    idx_backg = np.where(mask_flat == 0)[0]
+    
+    # Si hay tumor, tomamos todos los píxeles de tumor
+    # Y una muestra del fondo proporcional
+    if len(idx_tumor) > 0:
+        n_tumor = len(idx_tumor)
+        n_backg = min(len(idx_backg), n_tumor * RATIO_NO_TUMOR)
+        
+        # Selección aleatoria del fondo
+        if n_backg > 0:
+            idx_backg_sample = np.random.choice(idx_backg, n_backg, replace=False)
+            indices_finales = np.concatenate([idx_tumor, idx_backg_sample])
+        else:
+            indices_finales = idx_tumor # Caso raro: imagen es todo tumor
+            
+    else:
+        # Si NO hay tumor, tomamos una muestra pequeña del fondo para que el modelo conozca tejidos sanos
+        # (ej. 2000 píxeles por imagen sana ~ 3% de una imagen 256x256)
+        n_sample = min(len(idx_backg), 2000)
+        indices_finales = np.random.choice(idx_backg, n_sample, replace=False)
+
+    # Filtrar DataFrame y Array de etiquetas
+    X_subset = features.iloc[indices_finales]
+    Y_subset = mask_flat[indices_finales]
+    
+    X_list.append(X_subset)
+    Y_list.append(Y_subset)
+
+end_time_extraction = time.time() # END TIMER
+print(f"Tiempo de extracción (Train): {end_time_extraction - start_time_extraction:.2f} segundos")
+
+# Liberar memoria explícitamente
+import gc
+del img, mask, features, mask_flat, idx_tumor, idx_backg
+gc.collect()
 
 if len(X_list) == 0:
     print("Error: No se pudieron cargar imágenes.")
     exit()
 
 # Concatenar todos los datos
+print("Concatenando datos en memoria...")
 X_prev = pd.concat(X_list)
 Y_prev = np.concatenate(Y_list)
 
-print(f"Dataset de entrenamiento: {X_prev.shape[0]:,} píxeles, {X_prev.shape[1]} características")
-print(f"Distribución de clases: No Tumor={np.sum(Y_prev==0):,}, Tumor={np.sum(Y_prev==1):,}")
+print(f"Dataset de entrenamiento FINAL: {X_prev.shape[0]:,} píxeles")
+print(f"Distribución: No Tumor={np.sum(Y_prev==0):,}, Tumor={np.sum(Y_prev==1):,}")
+print(f"Uso de memoria estimado (X): {X_prev.memory_usage(deep=True).sum() / 1024**2:.2f} MB")
 
 # ==========================================
 # 5. ENTRENAMIENTO DEL MODELO
 # ==========================================
 print("\n--- Entrenando Random Forest... ---")
-
-# Configuración mejorada del modelo
-# - n_estimators=60: Más árboles para manejar las nuevas características de color (RGB, HSV, LAB)
-# - max_depth=20: Mayor profundidad para capturar relaciones complejas entre características
-# - min_samples_split=10: Evita sobreajuste requiriendo más muestras para dividir nodos
-# - min_samples_leaf=5: Cada hoja debe tener al menos 5 muestras
-# - class_weight='balanced': Compensa desbalance entre píxeles de tumor vs no-tumor
-# - n_jobs=-1: Usa todos los núcleos de CPU disponibles
+# Nota: class_weight sigue siendo útil aunque hayamos balanceado un poco
 model = RandomForestClassifier(
     n_estimators=60,
     max_depth=20,
@@ -289,7 +410,7 @@ model = RandomForestClassifier(
     n_jobs=-1,
     random_state=42,
     class_weight='balanced',
-    verbose=1  # Mostrar progreso del entrenamiento
+    verbose=0 
 )
 
 print(f"Configuración del modelo:")
@@ -297,104 +418,299 @@ print(f"  - Estimadores: 60")
 print(f"  - Características de entrada: {X_prev.shape[1]}")
 print(f"  - Total de píxeles: {X_prev.shape[0]:,}")
 
+start_time_train = time.time() # START TIMER
 model.fit(X_prev, Y_prev)
-print("\n¡Modelo entrenado exitosamente!")
+end_time_train = time.time() # END TIMER
+
+print(f"¡Modelo entrenado exitosamente en {end_time_train - start_time_train:.2f} segundos!")
 
 # ==========================================
-# 6. PRUEBA CON VISUALIZACIÓN MEJORADA
+# 6. EVALUACIÓN Y VISUALIZACIÓN
 # ==========================================
 print(f"\n--- Probando predicción en {len(test_imgs)} imágenes de test ---")
 
-# Calculamos cuántas vamos a mostrar (10 imágenes o las que haya si son menos)
-num_to_show = min(10, len(test_imgs))
+# Crear directorios para guardar resultados
+results_dir = os.path.join(PROJECT_ROOT, "results")
 
-# Seleccionar índices aleatorios del conjunto de test
-random.seed(42)  # Para reproducibilidad (puedes cambiar o quitar el seed)
-random_indices = random.sample(range(len(test_imgs)), num_to_show)
+# LIMPIEZA PREVIA: Borrar carpeta results antigua si existe
+if os.path.exists(results_dir):
+    import shutil
+    shutil.rmtree(results_dir)
+    print(f"Carpeta {results_dir} limpiada.")
 
-print(f"Visualizando {num_to_show} resultados con comparación detallada...\n")
+# Estructura de carpetas: TP se divide en High y Low Accuracy
+categories = ["TP", "TN", "FP", "FN"]
+for cat in categories:
+    os.makedirs(os.path.join(results_dir, cat), exist_ok=True)
 
-# for i in range(num_to_show):
-for idx, i in enumerate(random_indices):
+# Subcarpetas para TP
+tp_high_dir = os.path.join(results_dir, "TP", "High_Accuracy")
+tp_low_dir = os.path.join(results_dir, "TP", "Low_Accuracy")
+os.makedirs(tp_high_dir, exist_ok=True)
+os.makedirs(tp_low_dir, exist_ok=True)
+
+print(f"Los resultados se guardarán en: {results_dir}")
+
+# Acumuladores de métricas globales (Píxel a Píxel)
+all_true = []
+all_pred_raw = []
+all_pred_clean = []
+
+# Listas para métricas PROMEDIO (Por Imagen)
+tp_recalls = []   # Para guardar el % de acierto en casos TP
+tp_miss_rates = [] # Para guardar el % de fallo en casos TP
+fp_brain_ratios = [] # Para guardar el % de cerebro confundido en casos FP
+
+# Contadores para reporte de clasificación
+counts = {"TP": 0, "TN": 0, "FP": 0, "FN": 0}
+
+# Límite de visualización en pantalla
+DISPLAY_LIMIT = 10
+# Lista para guardar las figuras y mostrarlas al final
+figures_to_show = []
+
+print(f"Procesando {len(test_imgs)} imágenes (Visualizando primeras {DISPLAY_LIMIT})...\n")
+
+start_time_inference = time.time() # START TIMER
+
+for i in tqdm(range(len(test_imgs)), desc="Procesando Test Set"):
     test_path = test_imgs[i]
     test_mask_path = test_masks[i]
-
-    print(f"[{i+1}/{num_to_show}] Analizando: {os.path.basename(test_path)}")
-
+    img_name = os.path.basename(test_path)
+    
     img_test = cv2_imread_unicode(test_path, cv2.IMREAD_COLOR)
     mask_real = cv2_imread_unicode(test_mask_path, cv2.IMREAD_GRAYSCALE)
 
-    if img_test is None:
-        print(f"  ⚠️ Error: No se pudo leer la imagen")
-        continue
+    if img_test is None: continue
+
+    # Ground Truth a binario
+    mask_real_bin = (mask_real // 255).astype(np.uint8)
 
     try:
-        # ========================================
-        # PASO 1: PREDICCIÓN
-        # ========================================
+        # Predicción
         features_test, shape_original = extract_features(img_test)
         prediccion = model.predict(features_test)
-
-        # ========================================
-        # PASO 2: RECONSTRUCCIÓN
-        # ========================================
+        
         h, w = shape_original[0], shape_original[1]
         matriz_raw = prediccion.reshape(h, w).astype(np.uint8)
-
+        
         # ========================================
         # PASO 3: LIMPIEZA DE BORDES (Skull Stripping + Eliminación de Cerebelo)
         # ========================================
+        # IMPORTANTE: Necesitamos la máscara del cerebro para calcular métricas FP vs Brain
+        # Por eficiencia, la función eliminar_cerebelo_y_ruido ya calcula la máscara internamente,
+        # pero aquí la recalculamos rápido para tener el Área del Cerebro.
+        gray = cv2.cvtColor(img_test, cv2.COLOR_BGR2GRAY) if len(img_test.shape)==3 else img_test
+        ret, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        brain_area_pixels = 0
+        if len(contours) > 0:
+            brain_area_pixels = cv2.contourArea(max(contours, key=cv2.contourArea)) # Aprox del área cerebral
+
         matriz_limpia = eliminar_cerebelo_y_ruido(img_test, matriz_raw)
-        imagen_predicha = (matriz_limpia * 255).astype(np.uint8)
+        
+        # Acumular para métricas globales
+        all_true.extend(mask_real_bin.flatten())
+        all_pred_raw.extend(matriz_raw.flatten())
+        all_pred_clean.extend(matriz_limpia.flatten())
 
-        # ========================================
-        # PASO 4: VISUALIZACIÓN (4 SUBPLOTS)
-        # ========================================
+        # Métricas de esta imagen (Píxel a Píxel)
+        mets = calcular_metricas(mask_real_bin, matriz_limpia)
+
+        # --- CLASIFICACIÓN DE LA IMAGEN (TP, TN, FP, FN) ---
+        has_tumor = np.sum(mask_real_bin) > 0
+        detected = np.sum(matriz_limpia) > 0
+        
+        category = ""
+        save_folder = ""
+        extra_info = "" # Texto extra para el título
+        
+        if has_tumor and detected:
+            category = "TP"
+            # Calcular Recall específico de esta imagen (Acierto)
+            recall_img = mets["TP"] / (mets["TP"] + mets["FN"])
+            tp_recalls.append(recall_img)
+            tp_miss_rates.append(1 - recall_img)
+            
+            # Desglose TP
+            if recall_img > 0.70:
+                save_folder = tp_high_dir
+                cat_display = "TP (High Acc)"
+            else:
+                save_folder = tp_low_dir
+                cat_display = "TP (Low Acc)"
+                
+            # Info extendida TP: Muestra Acierto, Perdido y EXCESO (FP)
+            extra_info = f"OK: {mets['TP']} | Miss: {mets['FN']} | Excess(FP): {mets['FP']}"
+            
+        elif not has_tumor and not detected:
+            category = "TN"
+            save_folder = os.path.join(results_dir, "TN")
+            cat_display = "TN"
+            
+        elif has_tumor and not detected:
+            category = "FN"
+            save_folder = os.path.join(results_dir, "FN")
+            cat_display = "FN"
+            
+        elif not has_tumor and detected:
+            category = "FP"
+            save_folder = os.path.join(results_dir, "FP")
+            cat_display = "FP"
+            
+            # Calcular ratio de FP vs Cerebro
+            if brain_area_pixels > 0:
+                fp_ratio = mets["FP"] / brain_area_pixels
+                fp_brain_ratios.append(fp_ratio)
+                extra_info = f"FP: {mets['FP']} px ({fp_ratio:.2%} del cerebro)"
+            else:
+                extra_info = f"FP: {mets['FP']} px"
+        
+        counts[category] += 1
+
+        # Generar Figura
         fig, axes = plt.subplots(2, 2, figsize=(14, 10))
-        fig.suptitle(f'Detección de Tumor Cerebral - Imagen {i+1}/{num_to_show}',
-                     fontsize=16, fontweight='bold', y=0.98)
+        # Título enriquecido
+        title_lines = [
+            f'[{cat_display}] {img_name}',
+            f'IoU: {mets["IoU"]:.2%} | Dice: {mets["Dice"]:.2%}',
+            extra_info if extra_info else mets["Note"]
+        ]
+        fig.suptitle("\n".join(title_lines), fontsize=14, fontweight='bold', y=0.98)
 
-        # [1] Imagen Original (Color)
+        # [1] Original
         axes[0, 0].imshow(cv2.cvtColor(img_test, cv2.COLOR_BGR2RGB))
-        axes[0, 0].set_title('(1) Original MRI - Color', fontsize=12, fontweight='bold')
+        axes[0, 0].set_title(f'(1) Original')
         axes[0, 0].axis('off')
-        axes[0, 0].text(0.5, -0.05, 'Imagen a Color (RGB)',
-                        ha='center', transform=axes[0, 0].transAxes, fontsize=9, style='italic')
 
-        # [2] Máscara Real (Ground Truth)
-        if mask_real is not None:
-            axes[0, 1].imshow(mask_real, cmap='gray')
-            axes[0, 1].set_title('(2) Ground Truth - Máscara Real', fontsize=12, fontweight='bold', color='green')
-            tumor_pixels = np.sum(mask_real > 0)
-            axes[0, 1].text(0.5, -0.05, f'Píxeles de Tumor: {tumor_pixels:,}',
-                            ha='center', transform=axes[0, 1].transAxes, fontsize=9, style='italic')
-        else:
-            axes[0, 1].text(0.5, 0.5, 'Máscara no disponible', ha='center', va='center', fontsize=12)
+        # [2] Mask Real
+        axes[0, 1].imshow(mask_real, cmap='gray')
+        axes[0, 1].set_title('(2) Mask Real')
+        if has_tumor:
+             axes[0, 1].text(0.5, -0.1, f'Tumor Real: {mets["TP"] + mets["FN"]:,} px', transform=axes[0,1].transAxes, ha='center')
         axes[0, 1].axis('off')
 
-        # [3] Predicción Cruda (Sin Filtro)
+        # [3] Predicción Cruda
         axes[1, 0].imshow(matriz_raw, cmap='Reds')
-        axes[1, 0].set_title('(3) Predicción Cruda (Sin Filtro)', fontsize=12, fontweight='bold', color='orange')
-        raw_pixels = np.sum(matriz_raw > 0)
+        axes[1, 0].set_title('(3) Predicción Cruda')
+        pixels_raw = np.sum(matriz_raw)
+        axes[1, 0].text(0.5, -0.1, f'Raw Detect: {pixels_raw:,}', transform=axes[1,0].transAxes, ha='center')
         axes[1, 0].axis('off')
-        axes[1, 0].text(0.5, -0.05, f'Píxeles Detectados: {raw_pixels:,} | Incluye Ruido',
-                        ha='center', transform=axes[1, 0].transAxes, fontsize=9, style='italic')
 
-        # [4] Predicción Final (Limpia)
-        axes[1, 1].imshow(imagen_predicha, cmap='Reds')
-        axes[1, 1].set_title('(4) Predicción Final (Post-Procesada)', fontsize=12, fontweight='bold', color='red')
-        clean_pixels = np.sum(imagen_predicha > 0)
+        # [4] Predicción Limpia
+        axes[1, 1].imshow(matriz_limpia, cmap='Reds')
+        axes[1, 1].set_title('(4) Predicción Limpia')
+        
+        # Texto detallado TP/FP en el plot
+        res_text = f"Final: {mets['TP']+mets['FP']:,}"
+        if category == "TP":
+             # Aquí incluimos FP como parte del análisis de calidad (Exceso)
+             res_text += f"\n[OK] (TP): {mets['TP']:,}"
+             res_text += f"\n[MISS] (FN): {mets['FN']:,}"
+             res_text += f"\n[?] Excess (FP): {mets['FP']:,}"
+        elif category == "FP":
+             res_text += f"\n[!] Falsa Alarma: {mets['FP']:,} px"
+             
+        axes[1, 1].text(0.5, -0.15, res_text, transform=axes[1,1].transAxes, ha='center', color='red')
         axes[1, 1].axis('off')
-        axes[1, 1].text(0.5, -0.05, f'Píxeles Finales: {clean_pixels:,} | Skull Stripping + Limpieza',
-                        ha='center', transform=axes[1, 1].transAxes, fontsize=9, style='italic')
 
         plt.tight_layout()
-        plt.show()
-
-        print(f"  ✓ Procesamiento exitoso: {clean_pixels:,} píxeles de tumor detectados\n")
+        
+        # GUARDAR IMAGEN
+        save_path = os.path.join(save_folder, f"Result_{img_name}.png")
+        plt.savefig(save_path)
+        
+        plt.close(fig) # Liberar memoria inmediatamente
 
     except Exception as e:
-        print(f"  ⚠️ Error al procesar: {str(e)}\n")
+        print(f"Error procesando {test_path}: {e}")
+        import traceback
+        traceback.print_exc()
 
-if num_to_show == 0:
-    print("No hay imágenes de test disponibles.")
+# ==========================================
+# 7. REPORTE FINAL GLOBAL DETALLADO
+# ==========================================
+print("\n" + "="*60)
+print("RESUMEN DE CLASIFICACIÓN (Por Imagen)")
+print("="*60)
+print(f"Total Imágenes Analizadas: {len(test_imgs)}")
+print(f"✅ TN (Sano Correcto)   : {counts['TN']:3d}")
+print(f"✅ TP (Tumor Detectado) : {counts['TP']:3d}")
+print(f"❌ FP (Falsa Alarma)    : {counts['FP']:3d}")
+print(f"❌ FN (Tumor Perdido)   : {counts['FN']:3d}")
+
+# Reporte de Promedios
+print("-" * 60)
+print("ANÁLISIS DE CALIDAD DE DETECCIÓN (Promedios por Imagen)")
+print("-" * 60)
+if len(tp_recalls) > 0:
+    avg_recall = np.mean(tp_recalls)
+    avg_miss = np.mean(tp_miss_rates)
+    print(f"PARA CASOS TP (Tumor Detectado):")
+    print(f"  - Promedio de Tumor Detectado: {avg_recall:.2%} (Calidad del acierto)")
+    print(f"  - Promedio de Tumor Perdido  : {avg_miss:.2%}")
+else:
+    print("No hubo casos TP para analizar promedios.")
+
+if len(fp_brain_ratios) > 0:
+    avg_fp_ratio = np.mean(fp_brain_ratios)
+    print(f"\nPARA CASOS FP (Falsos Positivos):")
+    print(f"  - Promedio de Cerebro confundido con Tumor: {avg_fp_ratio:.2%} del área cerebral")
+else:
+    print("\nNo hubo casos FP para analizar promedios.")
+    
+if len(all_true) > 0:
+    print("\n" + "="*60)
+    print("MÉTRICAS GLOBALES (A Nivel de Píxel)")
+    print("="*60)
+    
+    y_true_all = np.array(all_true)
+    y_raw_all = np.array(all_pred_raw)
+    y_clean_all = np.array(all_pred_clean)
+    
+    def print_comprehensive_metrics(title, true, pred):
+        m = calcular_metricas(true, pred)
+        total_pixels = len(true)
+        
+        print(f"\n[{title}]")
+        print("-" * 40)
+        # Matriz de Confusión
+        print(f"True Positives  (TP): {m['TP']:10,} ({m['TP']/total_pixels:.2%} del total)")
+        print(f"True Negatives  (TN): {m['TN']:10,} ({m['TN']/total_pixels:.2%} del total)")
+        print(f"False Positives (FP): {m['FP']:10,} ({m['FP']/total_pixels:.2%} del total) <--- RUIDO")
+        print(f"False Negatives (FN): {m['FN']:10,} ({m['FN']/total_pixels:.2%} del total) <--- TUMOR PERDIDO")
+        print("-" * 40)
+        # Scores
+        print(f"Accuracy : {m.get('Accuracy', (m['TP']+m['TN'])/total_pixels):.2%}")
+        print(f"Recall   : {m['Recall']:.2%}")
+        print(f"Precision: {m['Precision']:.2%}")
+        print(f"F1-Score : {m.get('F1', m['Dice']):.2%}")
+        print(f"IoU      : {m['IoU']:.2%}")
+
+        return m
+
+    m_raw = print_comprehensive_metrics("PREDICCIÓN CRUDA (Sin Filtros)", y_true_all, y_raw_all)
+    m_clean = print_comprehensive_metrics("PREDICCIÓN FINAL (Skull Stripping)", y_true_all, y_clean_all)
+    
+    print("\n" + "="*60)
+    print("MEJORA DE LIMPIEZA")
+    print("="*60)
+    fp_reduction = m_raw['FP'] - m_clean['FP']
+    print(f"Falsos Positivos ELIMINADOS: {fp_reduction:,}")
+    if m_raw['FP'] > 0:
+        print(f"Reducción de Ruido: {(fp_reduction/m_raw['FP']):.2%}")
+
+end_time_inference = time.time() # END TIMER
+total_inference_time = end_time_inference - start_time_inference
+avg_inference_time = total_inference_time / len(test_imgs) if len(test_imgs) > 0 else 0
+
+print("\n" + "="*60)
+print("TIEMPOS DE EJECUCIÓN")
+print("="*60)
+print(f"Extracción Features (Train): {end_time_extraction - start_time_extraction:.2f} s")
+print(f"Entrenamiento Modelo     : {end_time_train - start_time_train:.2f} s")
+print(f"Inferencia Total (Test)  : {total_inference_time:.2f} s")
+print(f"Inferencia Promedio/Img  : {avg_inference_time:.4f} s ({1/avg_inference_time:.1f} FPS)")
+
+print("\nProceso guardado completado. Resultados en 'results/'")
+print("\n--- FIN DEL DIAGNÓSTICO ---")
