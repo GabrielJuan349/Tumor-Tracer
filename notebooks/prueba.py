@@ -196,12 +196,16 @@ print("¡Modelo entrenado!")
 # ==========================================
 print(f"\n--- Probando predicción en {len(test_imgs)} imágenes de test ---")
 
-# Usar la primera imagen del conjunto de test
-if len(test_imgs) > 0:
-    test_path = test_imgs[0]
-    test_mask_path = test_masks[0]
+# Calculamos cuántas vamos a mostrar (Mínimo 10 o las que haya si son menos)
+num_to_show = min(10, len(test_imgs))
+
+print(f"Visualizando los primeros {num_to_show} resultados...\n")
+
+for i in range(num_to_show):
+    test_path = test_imgs[i]
+    test_mask_path = test_masks[i]
     
-    print(f"Analizando: {os.path.basename(test_path)}")
+    print(f"[{i+1}/{num_to_show}] Analizando: {os.path.basename(test_path)}")
     
     img_test = cv2_imread_unicode(test_path, cv2.IMREAD_COLOR)
     mask_real = cv2_imread_unicode(test_mask_path, cv2.IMREAD_GRAYSCALE)
@@ -211,23 +215,21 @@ if len(test_imgs) > 0:
         features_test, shape_original = extract_features(img_test)
         prediccion = model.predict(features_test)
         
-        # 2. Reconstrucción Matriz Original
+        # 2. Reconstrucción
         h, w = shape_original[0], shape_original[1]
         matriz_raw = prediccion.reshape(h, w).astype(np.uint8)
         
-        # 3. >>> LIMPIEZA DE BORDES (NUEVO PASO) <<<
-        # Aquí eliminamos el cráneo y el ruido
+        # 3. Limpieza de bordes
         matriz_limpia = limpiar_bordes_cerebro(img_test, matriz_raw)
-        
         imagen_predicha = (matriz_limpia * 255).astype(np.uint8)
 
         # 4. Visualización (2 Filas x 2 Columnas)
-        plt.figure(figsize=(10, 10))
+        plt.figure(figsize=(10, 8))
         
         # Fila 1, Columna 1: Original
         plt.subplot(2, 2, 1)
         plt.imshow(cv2.cvtColor(img_test, cv2.COLOR_BGR2RGB))
-        plt.title("MRI Original")
+        plt.title(f"Imagen {i+1}: MRI Original")
         plt.axis('off')
         
         # Fila 1, Columna 2: Realidad
@@ -246,13 +248,12 @@ if len(test_imgs) > 0:
         # Fila 2, Columna 2: Predicción LIMPIA
         plt.subplot(2, 2, 4)
         plt.imshow(imagen_predicha, cmap='gray')
-        plt.title("Predicción Final\n(Limpia)")
+        plt.title("Predicción Final (Limpia)")
         plt.axis('off')
         
         plt.tight_layout()
         plt.show()
-        print("Gráfica generada exitosamente.")
     else:
-        print("No se pudo leer la imagen de prueba.")
+        print(f"Error al leer la imagen {i+1}")
 else:
     print("No hay imágenes de test disponibles.")
