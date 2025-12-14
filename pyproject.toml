@@ -1,21 +1,15 @@
 [project]
 name = "tumor-tracer"
 version = "0.7.0"
-description = "Add your description here"
+description = "Sistema de Segmentación de Tumores Cerebrales mediante Machine Learning Clásico"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
-    "matplotlib>=3.10.7",
-    "numpy>=2.3.5",
-    "pandas>=2.3.3",
-    "scikit-learn>=1.7.2",
-    "seaborn>=0.13.2",
     "opencv-python",
-    "scikit-image",
-    "scipy",
-    "tensorflow",
-    "keras",
-    "albumentations",
+    "pandas",
+    "numpy",
+    "scikit-learn",
+    "matplotlib",
     "tqdm",
-    "ipywidgets>=8.1.8",
+    "scipy",
 ]
