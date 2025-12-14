@@ -5,7 +5,7 @@ import os
 import glob
 import random
 from sklearn.ensemble import RandomForestClassifier
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import train_test_split, cross_val_score, KFold
 from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score, confusion_matrix
 from scipy import ndimage as nd
 import matplotlib
@@ -15,6 +15,7 @@ matplotlib.use('Agg')
 from matplotlib import pyplot as plt
 from tqdm import tqdm
 import time
+import gc
 
 # ==========================================
 # 0. FUNCIONES DE AYUDA (Lectura y Limpieza)
@@ -288,7 +289,8 @@ print(f"Encontrados {len(valid_pairs)} pares imagen-máscara válidos")
 # SELECCIÓN ALEATORIA DE 500 IMÁGENES
 # ==========================================
 random.seed(42)  # Para reproducibilidad
-sample_size = min(3929, len(valid_pairs))  # 100 o menos si no hay suficientes
+sample_size = min(500, len(valid_pairs))  # 100 o menos si no hay suficientes
+# sample_size = min(3929, len(valid_pairs))  # 100 o menos si no hay suficientes
 selected_pairs = random.sample(valid_pairs, sample_size)
 
 print(f"Seleccionadas {sample_size} imágenes al azar")
@@ -308,9 +310,7 @@ train_imgs, test_imgs, train_masks, test_masks = train_test_split(
 
 print(f"Train: {len(train_imgs)} imágenes | Test: {len(test_imgs)} imágenes")
 
-# ==========================================
-# 4. EXTRACCIÓN DE CARACTERÍSTICAS
-# ==========================================
+
 # ==========================================
 # 4. EXTRACCIÓN DE CARACTERÍSTICAS (OPTIMIZADO PARA MEMORIA)
 # ==========================================
@@ -380,7 +380,6 @@ end_time_extraction = time.time() # END TIMER
 print(f"Tiempo de extracción (Train): {end_time_extraction - start_time_extraction:.2f} segundos")
 
 # Liberar memoria explícitamente
-import gc
 del img, mask, features, mask_flat, idx_tumor, idx_backg
 gc.collect()
 
@@ -398,10 +397,99 @@ print(f"Distribución: No Tumor={np.sum(Y_prev==0):,}, Tumor={np.sum(Y_prev==1):
 print(f"Uso de memoria estimado (X): {X_prev.memory_usage(deep=True).sum() / 1024**2:.2f} MB")
 
 # ==========================================
-# 5. ENTRENAMIENTO DEL MODELO
+# 5. CROSS-VALIDATION CON K-FOLD (k=7)
 # ==========================================
-print("\n--- Entrenando Random Forest... ---")
-# Nota: class_weight sigue siendo útil aunque hayamos balanceado un poco
+
+print("\n--- Realizando Cross-Validation con K-Fold (k=7) ---")
+
+
+# Submuestreo para cross-validation (usar todos los píxeles es muy costoso)
+# Tomamos una muestra estratificada para CV
+sample_cv_size = min(100000, len(Y_prev))  # Máximo 100k píxeles para CV
+indices = np.random.choice(len(Y_prev), sample_cv_size, replace=False)
+X_cv = X_prev.iloc[indices]
+Y_cv = Y_prev[indices]
+
+print(f"Usando {sample_cv_size} píxeles para cross-validation")
+
+# Definir K-Fold
+start_time_cv = time.time()
+kfold = KFold(n_splits=7, shuffle=True, random_state=42)
+
+# Modelo para CV
+cv_model = RandomForestClassifier(
+    n_estimators=60,
+    max_depth=20,
+    min_samples_split=10,
+    min_samples_leaf=5,
+    n_jobs=-1,
+    random_state=42,
+    class_weight='balanced',
+    verbose=1
+)
+
+# Ejecutar cross-validation
+cv_scores = cross_val_score(cv_model, X_cv, Y_cv, cv=kfold, scoring='f1', n_jobs=-1)
+
+end_time_cv = time.time()
+
+print("\n" + "="*60)
+print("RESULTADOS CROSS-VALIDATION (7-Fold)")
+print("="*60)
+print(f"Píxeles analizados: {sample_cv_size:,}")
+print(f"Modelo: RandomForest (n_estimators=60, max_depth=20)")
+print(f"Métrica: F1-Score (Tumor)")
+print(f"Tiempo total: {end_time_cv - start_time_cv:.2f} segundos")
+
+print("\n" + "-"*60)
+print("F1-Scores por Fold:")
+print("-"*60)
+for i, score in enumerate(cv_scores, 1):
+    bar_length = int(score * 50)  # Barra visual de 50 caracteres máximo
+    bar = "█" * bar_length + "░" * (50 - bar_length)
+    print(f"  Fold {i:2d}: {score:.4f}  {bar}")
+
+print("\n" + "-"*60)
+print("Estadísticas Globales:")
+print("-"*60)
+print(f"  F1-Score Promedio : {cv_scores.mean():.4f}")
+print(f"  Desviación Estándar: {cv_scores.std():.4f}")
+print(f"  Intervalo Confianza: {cv_scores.mean():.4f} ± {cv_scores.std()*2:.4f} (95%)")
+print(f"  F1-Score Máximo   : {cv_scores.max():.4f} (Fold {np.argmax(cv_scores)+1})")
+print(f"  F1-Score Mínimo   : {cv_scores.min():.4f} (Fold {np.argmin(cv_scores)+1})")
+print(f"  Mediana           : {np.median(cv_scores):.4f}")
+print(f"  Rango             : {cv_scores.max() - cv_scores.min():.4f}")
+
+print("\n" + "-"*60)
+print("Interpretación:")
+print("-"*60)
+variance = cv_scores.std()
+if variance < 0.05:
+    stability = "✅ EXCELENTE - Modelo muy estable entre folds"
+elif variance < 0.10:
+    stability = "✓ BUENA - Varianza aceptable"
+else:
+    stability = "⚠ ALTA - Revisar distribución de datos o hiperparámetros"
+print(f"  Estabilidad: {stability}")
+
+avg_f1 = cv_scores.mean()
+if avg_f1 > 0.80:
+    performance = "✅ EXCELENTE - Detección de tumor muy precisa"
+elif avg_f1 > 0.60:
+    performance = "✓ BUENA - Detección aceptable"
+else:
+    performance = "⚠ MEJORABLE - Considerar más features o ajuste de parámetros"
+print(f"  Rendimiento: {performance}")
+
+print("="*60)
+
+# ==========================================
+# 6. ENTRENAMIENTO DEL MODELO FINAL
+# ==========================================
+print("\n--- Entrenando modelo final con todos los datos de train ---")
+
+start_time_train = time.time()
+
 model = RandomForestClassifier(
     n_estimators=60,
     max_depth=20,
@@ -410,19 +498,28 @@ model = RandomForestClassifier(
     n_jobs=-1,
     random_state=42,
     class_weight='balanced',
-    verbose=0 
+    verbose=1  # Mostrar progreso del entrenamiento
 )
+
+X = X_prev
+Y = Y_prev
 
 print(f"Configuración del modelo:")
 print(f"  - Estimadores: 60")
-print(f"  - Características de entrada: {X_prev.shape[1]}")
-print(f"  - Total de píxeles: {X_prev.shape[0]:,}")
+print(f"  - Max Depth: 20")
+print(f"  - Características de entrada: {X.shape[1]}")
+print(f"  - Total de píxeles: {X.shape[0]:,}")
 
-start_time_train = time.time() # START TIMER
-model.fit(X_prev, Y_prev)
-end_time_train = time.time() # END TIMER
+model.fit(X, Y)
 
-print(f"¡Modelo entrenado exitosamente en {end_time_train - start_time_train:.2f} segundos!")
+end_time_train = time.time()
+
+print(f"\n--- Modelo Entrenado Exitosamente en {end_time_train - start_time_train:.2f} segundos ---")
+
+# Guardar referencias para compatibilidad con celdas posteriores
+subset_size = len(train_imgs)
+image_paths = train_imgs + test_imgs
+mask_paths = train_masks + test_masks
 
 # ==========================================
 # 6. EVALUACIÓN Y VISUALIZACIÓN
@@ -705,12 +802,28 @@ total_inference_time = end_time_inference - start_time_inference
 avg_inference_time = total_inference_time / len(test_imgs) if len(test_imgs) > 0 else 0
 
 print("\n" + "="*60)
+print("VALIDACIÓN CRUZADA (K-FOLD) - RESUMEN")
+print("="*60)
+print(f"F1-Score Promedio (7-Fold): {cv_scores.mean():.4f} ± {cv_scores.std():.4f}")
+print(f"Rango de Scores: [{cv_scores.min():.4f} - {cv_scores.max():.4f}]")
+print(f"Mediana: {np.median(cv_scores):.4f}")
+print(f"Tiempo Cross-Validation: {end_time_cv - start_time_cv:.2f} s")
+if cv_scores.std() < 0.05:
+    print("Estabilidad del Modelo: ✅ EXCELENTE (Baja varianza entre folds)")
+elif cv_scores.std() < 0.10:
+    print("Estabilidad del Modelo: ✓ BUENA (Varianza aceptable)")
+else:
+    print("Estabilidad del Modelo: ⚠ REVISAR (Alta varianza entre folds)")
+
+print("\n" + "="*60)
 print("TIEMPOS DE EJECUCIÓN")
 print("="*60)
 print(f"Extracción Features (Train): {end_time_extraction - start_time_extraction:.2f} s")
-print(f"Entrenamiento Modelo     : {end_time_train - start_time_train:.2f} s")
-print(f"Inferencia Total (Test)  : {total_inference_time:.2f} s")
-print(f"Inferencia Promedio/Img  : {avg_inference_time:.4f} s ({1/avg_inference_time:.1f} FPS)")
+print(f"Cross-Validation (7-Fold) : {end_time_cv - start_time_cv:.2f} s")
+print(f"Entrenamiento Modelo Final : {end_time_train - start_time_train:.2f} s")
+print(f"Inferencia Total (Test)    : {total_inference_time:.2f} s")
+print(f"Inferencia Promedio/Img    : {avg_inference_time:.4f} s ({1/avg_inference_time:.1f} FPS)")
+print(f"TIEMPO TOTAL PIPELINE      : {end_time_extraction - start_time_extraction + end_time_cv - start_time_cv + end_time_train - start_time_train + total_inference_time:.2f} s")
 
 print("\nProceso guardado completado. Resultados en 'results/'")
 print("\n--- FIN DEL DIAGNÓSTICO ---")
