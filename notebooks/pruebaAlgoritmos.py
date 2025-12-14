@@ -1,27 +1,56 @@
-import pandas as pd
-import numpy as np
-import cv2
+
+"""
+Script de Detección de Tumores Cerebrales (Random Forest)
+=========================================================
+Este script implementa un pipeline completo de Machine Learning para segmentación de tumores.
+Incluye:
+1.  Preprocesamiento Avanzado (CLAHE, Denoise, Alineación PCA).
+2.  Ingeniería de Características (Color, Textura, Espacial, Simetría, Interacción).
+3.  Entrenamiento eficiente con Subsampling.
+4.  Validación Cruzada y Evaluación detallada.
+
+Autor: [Tu Nombre/Equipo]
+Fecha: Diciembre 2025
+"""
+
 import os
 import glob
 import random
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.model_selection import train_test_split, cross_val_score, KFold
-from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score, confusion_matrix
-from scipy import ndimage as nd
-# from skimage.feature import graycomatrix, graycoprops # REMOVED: Dependency not found, using CV2 alternatives
-import matplotlib
-# Configurar backend "Agg" (No interactivo) para evitar errores de hilos/Tcl
-# Esto significa que las imágenes se guardarán pero NO se abrirán ventanas emergentes.
-matplotlib.use('Agg')
-from matplotlib import pyplot as plt
-from tqdm import tqdm
 import time
 import gc
+import shutil
+import traceback
+
+import pandas as pd
+import numpy as np
+import cv2
+import matplotlib
+import matplotlib.pyplot as plt
+from scipy import ndimage as nd
+from tqdm import tqdm
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.model_selection import train_test_split, cross_val_score, KFold, cross_validate
+from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score
+
+# Configurar backend no interactivo para estabilidad en Windows
+matplotlib.use('Agg')
+
 
 # ==========================================
-# 0. FUNCIONES DE AYUDA (Lectura y Limpieza)
+# 1. CONFIGURACIÓN Y CONSTANTES
+# ==========================================
+RANDOM_STATE = 42
+RF_ESTIMATORS = 60
+RF_MAX_DEPTH = 20
+RF_CLASS_WEIGHT = {0: 1, 1: 1.5} # Peso 1.5 a Tumor para priorizar sensibilidad sin disparar FPs
+SUBSAMPLE_RATIO = 3  # Ratio 1 pixel tumor : 3 pixeles fondo
+CV_FOLDS = 7
+
+# ==========================================
+# 2. FUNCIONES DE LECTURA E I/O
 # ==========================================
 def cv2_imread_unicode(path, flag=cv2.IMREAD_COLOR):
+    """Lee imágenes soportando caracteres unicode en la ruta (Windows)."""
     try:
         stream = np.fromfile(path, dtype=np.uint8)
         img = cv2.imdecode(stream, flag)
@@ -30,157 +59,79 @@ def cv2_imread_unicode(path, flag=cv2.IMREAD_COLOR):
         print(f"Error leyendo {path}: {e}")
         return None
 
-def eliminar_cerebelo_y_ruido(img_rgb, prediccion_binaria):
-    """
-    Skull Stripping Avanzado + Limpieza
+def limpiar_directorio_resultados(path):
+    """Elimina y recrea el directorio de resultados para una ejecución limpia."""
+    if os.path.exists(path):
+        shutil.rmtree(path)
     
-    CAMBIO IMPORTANTE: SE HA ELIMINADO EL RECORTE FIJO DEL 40% INFERIOR.
-    Ahora confiamos en que el modelo (entrenado con GLCM y Spatial Features)
-    sepa distinguir el cerebelo del tumor.
-    """
-    # ========================================
-    # PASO 1: SKULL STRIPPING CON HSV (Igual que antes)
-    # ========================================
-    img_hsv = cv2.cvtColor(img_rgb, cv2.COLOR_BGR2HSV)
-    v_channel = img_hsv[:, :, 2]
-
-    ret, thresh = cv2.threshold(v_channel, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-    if len(contours) == 0:
-        return np.zeros_like(prediccion_binaria)
-
-    largest_contour = max(contours, key=cv2.contourArea)
-    brain_mask = np.zeros_like(v_channel)
-    cv2.drawContours(brain_mask, [largest_contour], -1, 255, -1)
-
-    # ========================================
-    # PASO 2: ELIMINACIÓN DE RECORTE FIJO (ELIMINADO)
-    # ========================================
-    # ANTES: cerebelo_cutoff = int(h * 0.60); brain_mask[cerebelo_cutoff:, :] = 0
-    # AHORA: No hacemos nada aquí. Mantenemos todo el cerebro.
-
-    # Erosión para limpiar bordes del cráneo
-    kernel = np.ones((5, 5), np.uint8)
-    brain_mask = cv2.erode(brain_mask, kernel, iterations=2)
-
-    # ========================================
-    # PASO 3: APLICAR MÁSCARA A LA PREDICCIÓN
-    # ========================================
-    prediccion_limpia = cv2.bitwise_and(prediccion_binaria, prediccion_binaria, mask=brain_mask)
-
-    # ========================================
-    # PASO 4: FILTRAR COMPONENTES PEQUEÑOS Y RUIDO
-    # ========================================
-    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
-        prediccion_limpia.astype(np.uint8), connectivity=8
-    )
-
-    output = np.zeros_like(prediccion_limpia)
+    subdirs = ["TP", "TN", "FP", "FN"]
+    for cat in subdirs:
+        os.makedirs(os.path.join(path, cat), exist_ok=True)
     
-    # Filtrar por área (ruido vs tumor real)
-    # Umbral dinámico? Por ahora 50px es seguro para tumores visibles
-    MIN_TUMOR_PIXELS = 50 
-    
-    for i in range(1, num_labels):
-        area = stats[i, cv2.CC_STAT_AREA]
-        if area >= MIN_TUMOR_PIXELS:
-            output[labels == i] = 1
+    # Subcarpetas TP por calidad (Deciles) se crean dinámicamente luego
+    print(f"Directorio de resultados preparado: {path}")
 
-    # ========================================
-    # PASO 5: LIMPIEZA MORFOLÓGICA
-    # ========================================
-    kernel_clean = np.ones((3, 3), np.uint8)
-    output = cv2.morphologyEx(output.astype(np.uint8), cv2.MORPH_OPEN, kernel_clean, iterations=2)
-    output = cv2.morphologyEx(output, cv2.MORPH_CLOSE, kernel_clean, iterations=1)
-
-    return output
-
+# ==========================================
+# 3. FUNCIONES DE PREPROCESAMIENTO
+# ==========================================
 def apply_clahe(img):
-    """
-    Aplica CLAHE al canal de Luminancia (L) del espacio LAB.
-    """
+    """Mejora de contraste adaptativa (CLAHE) en canal L (LAB)."""
     lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
     l, a, b = cv2.split(lab)
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
     l_clahe = clahe.apply(l)
-    lab_merged = cv2.merge((l_clahe, a, b))
-    return cv2.cvtColor(lab_merged, cv2.COLOR_LAB2BGR)
+    return cv2.cvtColor(cv2.merge((l_clahe, a, b)), cv2.COLOR_LAB2BGR)
 
 def apply_denoise(img):
-    """
-    Elimina ruido 'sal y pimienta' usando Filtro de Mediana.
-    Conserva los bordes mejor que el desenfoque gaussiano.
-    """
+    """Filtro de Mediana para eliminar ruido 'sal y pimienta'."""
     return cv2.medianBlur(img, 3)
 
 def align_brain(img, mask=None):
     """
-    Alinea el cerebro verticalmente usando PCA.
-    Maneja la ambigüedad de 180 grados usando heurísticas de masa.
+    Alineación geométrica basada en PCA.
+    Rota el cerebro para que el eje mayor sea vertical.
+    Corrige orientación invertida usando heurística de masa.
     """
-    # 1. Obtener nube de puntos
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
     puntos = np.column_stack(np.where(thresh > 0)) # (y, x)
     
     if len(puntos) == 0:
-        return img, mask
+        return (img, mask) if mask is not None else img
 
-    # 2. PCA
-    # mean: (y, x) centroide
+    # PCA Compute
     mean, eigenvectors, _ = cv2.PCACompute2(puntos.astype(np.float32), mean=None)
+    center_img = (img.shape[1] // 2, img.shape[0] // 2)
+    center_brain = (mean[0, 1], mean[0, 0])
     
-    h, w = img.shape[:2]
-    center_img = (w // 2, h // 2)
-    center_brain = (mean[0, 1], mean[0, 0]) # (x, y)
-    
-    # 3. Ángulo
+    # Ángulo y Rotación Base
     angle = np.arctan2(eigenvectors[0, 1], eigenvectors[0, 0])
     rotation_angle = np.degrees(angle)
     
-    # Alinear al eje vertical (90 /-90 grados)
-    # Por defecto PCA da el eje mayor. Queremos que sea vertical.
-    # Si angle es 0 (horizontal), rotamos 90.
+    # Forzar verticalidad
     if abs(rotation_angle) < 45: 
         rotation_angle += 90
         
-    # 4. Matriz de Rotación Inicial
     M = cv2.getRotationMatrix2D(center_brain, rotation_angle, 1.0)
-    tx = center_img[0] - center_brain[0]
-    ty = center_img[1] - center_brain[1]
-    M[0, 2] += tx
-    M[1, 2] += ty
+    # Ajuste de traslación para centrar
+    M[0, 2] += center_img[0] - center_brain[0]
+    M[1, 2] += center_img[1] - center_brain[1]
     
-    # 5. Aplicar Rotación temporal para verificar orientación
-    img_aligned_temp = cv2.warpAffine(img, M, (w, h), flags=cv2.INTER_CUBIC)
+    # Verificación de Orientación (Arriba vs Abajo)
+    h, w = img.shape[:2]
+    img_temp = cv2.warpAffine(img, M, (w, h), flags=cv2.INTER_CUBIC)
     
-    # --- CHECK DE ORIENTACIÓN (RESOLVER AMBIGÜEDAD 180 GRADOS) ---
-    # Heurística: En cortes axiales, el cerebro suele ser más "ancho" en la parte superior (Parietal/frontal)
-    # y más estrecho o con huecos en la parte inferior (Fosa posterior/Cerebelo).
-    # O, el centro de masa de la mitad superior vs mitad inferior.
+    gray_aligned = cv2.cvtColor(img_temp, cv2.COLOR_BGR2GRAY)
+    _, thresh_a = cv2.threshold(gray_aligned, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
     
-    # Dividir imagen alineada en mitad superior e inferior
-    gray_aligned = cv2.cvtColor(img_aligned_temp, cv2.COLOR_BGR2GRAY)
-    _, thresh_aligned = cv2.threshold(gray_aligned, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    
-    top_half = thresh_aligned[:h//2, :]
-    bottom_half = thresh_aligned[h//2:, :]
-    
-    top_mass = np.sum(top_half)
-    bottom_mass = np.sum(bottom_half)
-    
-    # Si la parte de abajo tiene MUCHA más masa que la de arriba, probablemente está invertida
-    # (El cerebro es generalmente más masivo en los hemisferios que en la punta del tronco/cerebelo)
-    # Esta es una heurística simple y puede fallar en cortes muy específicos, pero ayuda.
-    if bottom_mass > top_mass * 1.1: # Margen del 10%
-        rotation_angle += 180 # Girar 180 grados
-        # Recalcular Matriz con nuevo ángulo
+    # Heurística: Si la mitad inferior tiene mucha más masa, está invertido
+    if np.sum(thresh_a[h//2:, :]) > np.sum(thresh_a[:h//2, :]) * 1.1:
+        rotation_angle += 180
         M = cv2.getRotationMatrix2D(center_brain, rotation_angle, 1.0)
-        M[0, 2] += tx
-        M[1, 2] += ty
+        M[0, 2] += center_img[0] - center_brain[0]
+        M[1, 2] += center_img[1] - center_brain[1]
 
-    # 6. Aplicar Transformación Final
+    # Transformación Final
     img_aligned = cv2.warpAffine(img, M, (w, h), flags=cv2.INTER_CUBIC)
     if mask is not None:
         mask_aligned = cv2.warpAffine(mask, M, (w, h), flags=cv2.INTER_NEAREST)
@@ -188,89 +139,64 @@ def align_brain(img, mask=None):
         
     return img_aligned
 
-def get_symmetry_feature(img_aligned):
-    """Calcula mapa de asimetría."""
-    gray = cv2.cvtColor(img_aligned, cv2.COLOR_BGR2GRAY)
-    flipped = cv2.flip(gray, 1) # Flip Horizontal
-    diff = cv2.absdiff(gray, flipped)
-    return diff
-
-def calcular_metricas(y_true, y_pred):
-    # ... (Mismo código anterior)
-    y_true_flat = y_true.reshape(-1)
-    y_pred_flat = y_pred.reshape(-1)
-    tp = np.sum((y_true_flat == 1) & (y_pred_flat == 1))
-    fp = np.sum((y_true_flat == 0) & (y_pred_flat == 1))
-    fn = np.sum((y_true_flat == 1) & (y_pred_flat == 0))
-    tn = np.sum((y_true_flat == 0) & (y_pred_flat == 0))
+def eliminar_cerebelo_y_ruido(img_input, pred_binaria):
+    """
+    Limpieza post-predicción (Morphology + Size Filter).
+    Nota: Se eliminó el recorte fijo del 40%; el modelo ahora infiere la ubicación.
+    """
+    # 1. Máscara del cerebro (ROI)
+    if len(img_input.shape) == 3:
+        gray = cv2.cvtColor(img_input, cv2.COLOR_BGR2GRAY)
+    else:
+        gray = img_input
+        
+    _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     
-    if np.sum(y_true_flat) == 0:
-        if np.sum(y_pred_flat) == 0:
-            return {"IoU":1.0, "Dice":1.0, "Precision":1.0, "Recall":1.0, "TP":0, "FP":0, "FN":0, "TN":tn, "Note":"No Tumor (Correcto)"}
-        else:
-            return {"IoU":0.0, "Dice":0.0, "Precision":0.0, "Recall":0.0, "TP":0, "FP":fp, "FN":0, "TN":tn, "Note":"No Tumor (Falso Positivo)"}
+    brain_mask = np.zeros_like(pred_binaria)
+    if len(contours) > 0:
+        cv2.drawContours(brain_mask, [max(contours, key=cv2.contourArea)], -1, 1, -1)
+        brain_mask = cv2.erode(brain_mask, np.ones((5,5), np.uint8), iterations=2)
 
-    iou = tp / (tp + fp + fn) if (tp + fp + fn) > 0 else 0.0
-    dice = (2 * tp) / (2 * tp + fp + fn) if (2 * tp + fp + fn) > 0 else 0.0
-    precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
-    recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
-    
-    return {"IoU":iou, "Dice":dice, "Precision":precision, "Recall":recall, "TP":tp, "FP":fp, "FN":fn, "TN":tn, "Note":"Tumor Presente"}
+    # 2. Aplicar ROI
+    cleaned = cv2.bitwise_and(pred_binaria, pred_binaria, mask=brain_mask)
 
-# ==========================================
-# 1. CONFIGURACIÓN DE RUTAS
-# ==========================================
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-PROJECT_ROOT = os.path.dirname(BASE_DIR) 
+    # 3. Filtrar manchas pequeñas (<50 px)
+    num, labels, stats, _ = cv2.connectedComponentsWithStats(cleaned.astype(np.uint8))
+    output = np.zeros_like(cleaned)
+    for i in range(1, num):
+        if stats[i, cv2.CC_STAT_AREA] >= 50:
+            output[labels == i] = 1
 
-POSSIBLE_PATHS = [
-    os.path.join(PROJECT_ROOT, "data", "dataset_plano"),
-    os.path.join(PROJECT_ROOT, "data", "kaggle_3m"),
-    "../data/dataset_plano/",
-]
-
-files_found = []
-print("--- DIAGNÓSTICO DE RUTAS ---")
-for path in POSSIBLE_PATHS:
-    full_path = os.path.abspath(path)
-    if os.path.exists(full_path):
-        candidates = glob.glob(os.path.join(full_path, '**', '*_mask.tif'), recursive=True)
-        if len(candidates) > 0:
-            print(f" -> ¡ÉXITO! Encontradas {len(candidates)} máscaras en: {full_path}")
-            files_found = candidates
-            break
-
-if not files_found:
-    print("[ERROR] No se encontraron archivos.")
-    exit()
+    # 4. Suavizado Morfológico
+    kernel = np.ones((3, 3), np.uint8)
+    output = cv2.morphologyEx(output.astype(np.uint8), cv2.MORPH_OPEN, kernel, iterations=2)
+    return cv2.morphologyEx(output, cv2.MORPH_CLOSE, kernel, iterations=1)
 
 # ==========================================
-# 2. FEATURE EXTRACTION AVANZADO
+# 4. INGENIERÍA DE CARACTERÍSTICAS
 # ==========================================
+def get_symmetry_feature(img):
+    """Mapa de diferencia absoluto entre hemisferios (asume alineación vertical)."""
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    return cv2.absdiff(gray, cv2.flip(gray, 1))
+
 def extract_features(img):
     """
-    Extrae características avanzadas:
-    - RGB, HSV, LAB
-    - Textura: Canny, Gaussian, Sobel
-    - NUEVO: GLCM (Textura Haralick)
-    - NUEVO: Spatial (X, Y, Radial)
-    - NUEVO: Simetría
+    Genera un vector de características para cada píxel.
+    Features: RGB, HSV, LAB, Bordes, Textura Local, Espaciales, Simetría, Interacción Verde.
     """
     df = pd.DataFrame()
     h, w, _ = img.shape
 
-    # --- 1. Espacios de Color ---
+    # --- Color ---
     df['R'] = img[:, :, 2].reshape(-1)
     df['G'] = img[:, :, 1].reshape(-1)
     df['B'] = img[:, :, 0].reshape(-1)
-
-    # --- Feature Específica para Ruido Verde ---
-    # Green_Excess: Cuánto domina el verde sobre el promedio de rojo y azul.
-    # Ayuda a distinguir ruido verde puro de tejidos complejos.
-    r_float = df['R'].astype(np.float32)
-    g_float = df['G'].astype(np.float32)
-    b_float = df['B'].astype(np.float32)
-    df['Green_Excess'] = g_float - (r_float + b_float) / 2.0
+    
+    # Feature crítica: Green Excess (G - avg(R,B))
+    # Discrimina 'verde artefacto' de 'verde tejido'
+    df['Green_Excess'] = df['G'].astype(np.float32) - (df['R'].astype(np.float32) + df['B'].astype(np.float32)) / 2.0
 
     img_hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
     df['H'] = img_hsv[:, :, 0].reshape(-1)
@@ -282,678 +208,338 @@ def extract_features(img):
     df['A'] = img_lab[:, :, 1].reshape(-1)
     df['B_lab'] = img_lab[:, :, 2].reshape(-1)
 
-    # --- 2. Textura Básica (Grises) ---
+    # --- Textura ---
     img_gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     df['Canny'] = cv2.Canny(img_gray, 100, 200).reshape(-1)
     df['Gaussian'] = nd.gaussian_filter(img_gray, sigma=3).reshape(-1)
     
-    # Sobel
     sobel_x = cv2.Sobel(img_gray, cv2.CV_64F, 1, 0, ksize=3)
     sobel_y = cv2.Sobel(img_gray, cv2.CV_64F, 0, 1, ksize=3)
-    df['Sobel_Mag'] = np.sqrt(sobel_x**2 + sobel_y**2).reshape(-1) # Magnitud del gradiente
+    df['Sobel_Mag'] = np.sqrt(sobel_x**2 + sobel_y**2).reshape(-1)
 
-    # --- 3. NUEVO: CARACTERÍSTICAS ESPACIALES (Coordinate Maps) ---
-    # Normalizado 0..1
-    # Y aumenta hacia abajo. Si la imagen está alineada, Y=1 es cerebelo.
-    y_grid, x_grid = np.mgrid[0:h, 0:w]
-    
-    # Normalización
-    y_norm = y_grid.astype(np.float32) / h
-    x_norm = x_grid.astype(np.float32) / w
-    
-    # Distancia Radial al centro (Rotation Invariant!)
-    # Centro = (0.5, 0.5) en coordenadas normalizadas
-    cy, cx = 0.5, 0.5
-    radial_dist = np.sqrt((y_norm - cy)**2 + (x_norm - cx)**2)
-    
-    df['Spatial_Y'] = y_norm.reshape(-1)
-    df['Spatial_X'] = x_norm.reshape(-1) # Útil para simetría implícita
-    df['Spatial_Radial'] = radial_dist.reshape(-1)
-
-    # --- 4. NUEVO: TEXTURA GLCM (Calculada en ventana móvil es muy lento, se usa aproximación o filtros) ---
-    # Calcular GLCM rolling window pixel a pixel es PROHIBITIVO en Python puro.
-    # Alternativa eficiente: Calcular propiedades GLCM globales en parches O usar filtros de entropía/desv local.
-    # Para simplicidad y velocidad en este script "prueba.py":
-    # Usaremos filtros de "Varianza Local" (Entropy) que capturan textura similar a GLCM Homogeneity/Entropy.
-    
-    # from skimage.filters.rank import entropy
-    # from skimage.morphology import disk
-    
-    # Entropía local (Radio 3) - Detecta complejidad de textura
-    # El cerebelo tiene textura regular -> Entropía media
-    # Tumor tiene textura caótica -> Entropía alta o nula (necrosis)
-    # Convertir a uint8 para skimage
-    # Se usa img_gray directamente.
-    
-    # Optimización: GLCM Entropy aproximada por Entropy Filter
-    # entropy_img = entropy(img_gray, disk(3)) # Lento en CPU single thread para imágenes 512x512
-    # Usaremos desviación estándar local como proxy rápido de "Complejidad de Textura"
-    
-
-    
-    # Textura: Desviación Estándar Local (Kernel 5x5)
-    mean, std_dev = cv2.meanStdDev(img_gray) # Global, no sirve
-    
-    # Calcular media local y luego std dev local manualmente con blur
-    # E[X^2] - (E[X])^2
-    img_gray_f = img_gray.astype(np.float32)
-    mu = cv2.blur(img_gray_f, (5, 5))
-    mu2 = cv2.blur(img_gray_f**2, (5, 5))
+    # Desviación Estándar Local (Proxy de Entropía/Complejidad)
+    img_f = img_gray.astype(np.float32)
+    mu = cv2.blur(img_f, (5, 5))
+    mu2 = cv2.blur(img_f**2, (5, 5))
     sigma = np.sqrt(np.maximum(mu2 - mu**2, 0))
-    
     df['Texture_LocalStd'] = sigma.reshape(-1)
 
-    # --- Feature de Interacción (Green * Texture) ---
-    # Hipótesis: Ruido verde es liso (Baja textura). Tumor verde es rugoso (Alta textura).
-    # Multiplicamos Green_Excess por Textura.
-    # Si es verde y rugoso -> Valor Alto (Probable Tumor)
-    # Si es verde y liso -> Valor Bajo/Negativo
+    # --- Interacción ---
+    # Green * Texture: Ayuda a diferenciar ruido verde (liso) de tumor verde (rugoso)
     df['Green_Texture'] = df['Green_Excess'] * df['Texture_LocalStd']
 
-    # Nota: Si el usuario exige GLCM Haralick real, requeriría una implementación optimizada en C++ o 
-    # usar features de parches grandes. Para píxel a píxel, Local Std Dev + Sobel + Entropy es el estándar rápido.
-    # Vamos a añadir Entropía si no tarda demasiado.
-    
-    # --- 5. Simetría ---
-    # Asume imagen alineada
+    # --- Espaciales ---
+    y, x = np.mgrid[0:h, 0:w]
+    df['Spatial_Y'] = (y / h).astype(np.float32).reshape(-1)
+    df['Spatial_X'] = (x / w).astype(np.float32).reshape(-1)
+    df['Spatial_Radial'] = np.sqrt((df['Spatial_Y'] - 0.5)**2 + (df['Spatial_X'] - 0.5)**2)
+
+    # --- Simetría ---
     df['Symmetry'] = get_symmetry_feature(img).reshape(-1)
 
     return df, (h, w)
 
 # ==========================================
-# 3. BÚSQUEDA Y SELECCIÓN DE IMÁGENES
+# 5. METRICAS Y EVALUACIÓN
 # ==========================================
-print("\n--- Buscando imágenes ---")
-
-# Obtener todas las máscaras encontradas
-mask_paths = files_found
-# Derivar las rutas de imágenes desde las máscaras
-img_paths = [f.replace('_mask.tif', '.tif') for f in mask_paths]
-
-# Crear pares imagen-máscara válidos
-valid_pairs = []
-for img_path, mask_path in zip(img_paths, mask_paths):
-    if os.path.exists(img_path):
-        valid_pairs.append((img_path, mask_path))
-
-print(f"Encontrados {len(valid_pairs)} pares imagen-máscara válidos")
-
-# ==========================================
-# SELECCIÓN ALEATORIA DE 500 IMÁGENES
-# ==========================================
-random.seed(42)  # Para reproducibilidad
-sample_size = min(500, len(valid_pairs))  # 100 o menos si no hay suficientes
-# sample_size = min(3929, len(valid_pairs))  # 100 o menos si no hay suficientes
-selected_pairs = random.sample(valid_pairs, sample_size)
-
-print(f"Seleccionadas {sample_size} imágenes al azar")
-
-# Separar en listas
-selected_images = [p[0] for p in selected_pairs]
-selected_masks = [p[1] for p in selected_pairs]
+def calcular_metricas(y_true, y_pred):
+    """Calcula métricas a nivel de píxel."""
+    true_flat = y_true.reshape(-1)
+    pred_flat = y_pred.reshape(-1)
+    
+    tp = np.sum((true_flat == 1) & (pred_flat == 1))
+    fp = np.sum((true_flat == 0) & (pred_flat == 1))
+    fn = np.sum((true_flat == 1) & (pred_flat == 0))
+    tn = np.sum((true_flat == 0) & (pred_flat == 0))
+    
+    total_pos = tp + fn
+    total_det = tp + fp
+    
+    recall = tp / total_pos if total_pos > 0 else 0.0
+    precision = tp / total_det if total_det > 0 else 0.0
+    iou = tp / (tp + fp + fn) if (tp + fp + fn) > 0 else 0.0
+    dice = 2*tp / (2*tp + fp + fn) if (2*tp + fp + fn) > 0 else 0.0
+    
+    return {
+        "TP": tp, "FP": fp, "FN": fn, "TN": tn,
+        "Recall": recall, "Precision": precision, "IoU": iou, "Dice": dice
+    }
 
 # ==========================================
-# SPLIT TRAIN/TEST (80/20)
+# 6. PIPELINE PRINCIPAL (MAIN)
 # ==========================================
-train_imgs, test_imgs, train_masks, test_masks = train_test_split(
-    selected_images, selected_masks, 
-    test_size=0.2, 
-    random_state=42
-)
-
-print(f"Train: {len(train_imgs)} imágenes | Test: {len(test_imgs)} imágenes")
-
-
-# ==========================================
-# 4. EXTRACCIÓN DE CARACTERÍSTICAS (OPTIMIZADO PARA MEMORIA)
-# ==========================================
-print(f"\n--- Extrayendo características de {len(train_imgs)} imágenes de entrenamiento ---")
-
-X_list = []
-Y_list = []
-
-# Ratio de subsampling para No-Tumor.
-# Guardamos todos los píxeles de tumor y 3 veces esa cantidad de fondo.
-# Esto reduce masivamente el uso de RAM sin perder información crítica.
-RATIO_NO_TUMOR = 3 
-
-print(f"Estrategia de Subsampling: 1 Tumor : {RATIO_NO_TUMOR} No-Tumor")
-
-start_time_extraction = time.time() # START TIMER
-
-for img_path, mask_path in tqdm(zip(train_imgs, train_masks), total=len(train_imgs), desc="Extrayendo features"):
-    img = cv2_imread_unicode(img_path, cv2.IMREAD_COLOR)
-    mask = cv2_imread_unicode(mask_path, cv2.IMREAD_GRAYSCALE)
+if __name__ == "__main__":
+    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+    PROJECT_ROOT = os.path.dirname(BASE_DIR)
     
-    if img is None or mask is None:
-        continue
+    print("\n=== INICIANDO PIPELINE DE DETECCIÓN DE TUMORES ===")
     
-    # --- PREPROCESAMIENTO NUEVO (CLAHE + ALINEACIÓN) ---
-    # 1. Mejorar Contraste y Reducir Ruido
-    img = apply_clahe(img)
-    img = apply_denoise(img)
+    # --- 1. Buscar Datos ---
+    print("\n[1] Buscando Dataset...")
+    search_paths = [
+        os.path.join(PROJECT_ROOT, "data", "dataset_plano"),
+        os.path.join(PROJECT_ROOT, "data", "kaggle_3m")
+    ]
     
-    # 2. Alinear Geométricamente (Cerebro Vertical)
-    # Importante: Alinear imagen Y máscara simultáneamente
-    img, mask = align_brain(img, mask)
+    files_found = []
+    for p in search_paths:
+        if os.path.exists(p):
+            curr = glob.glob(os.path.join(p, '**', '*_mask.tif'), recursive=True)
+            if curr:
+                files_found = curr
+                print(f"    -> Encontrado: {p} ({len(curr)} máscaras)")
+                break
     
-    # Normalizar máscara a 0 y 1
-    mask = mask // 255 
-    mask_flat = mask.reshape(-1)
+    if not files_found:
+        print("[ERROR] No se encontraron datos. Revise las rutas.")
+        exit()
 
-    # Extraer características (Ahora incluye Simetría)
-    features, _ = extract_features(img)
+    # Preparar pares validos
+    valid_pairs = []
+    for mask_p in files_found:
+        img_p = mask_p.replace('_mask.tif', '.tif')
+        if os.path.exists(img_p):
+            valid_pairs.append((img_p, mask_p))
+
+    # Selección Aleatoria
+    sample_size = min(500, len(valid_pairs))
+    random.seed(RANDOM_STATE)
+    selected = random.sample(valid_pairs, sample_size)
+    print(f"    -> Seleccionadas {len(selected)} imágenes para el proceso.")
+
+    # Split Train/Test
+    train_pairs, test_pairs = train_test_split(selected, test_size=0.2, random_state=RANDOM_STATE)
+    print(f"    -> Train: {len(train_pairs)} | Test: {len(test_pairs)}")
+
+    # --- 2. Extracción de Features (Entrenamiento) ---
+    print(f"\n[2] Extracción de Características (Train)...")
+    X_train_list, Y_train_list = [], []
     
-    # OPTIMIZACIÓN DE MEMORIA: Convertir a float32 inmediatamente
-    features = features.astype(np.float32)
-    
-    # --- SUBSAMPLING INTELIGENTE ---
-    # Identificar índices
-    idx_tumor = np.where(mask_flat == 1)[0]
-    idx_backg = np.where(mask_flat == 0)[0]
-    
-    # Si hay tumor, tomamos todos los píxeles de tumor
-    # Y una muestra del fondo proporcional
-    if len(idx_tumor) > 0:
-        n_tumor = len(idx_tumor)
-        n_backg = min(len(idx_backg), n_tumor * RATIO_NO_TUMOR)
+    start_time = time.time()
+    for img_p, mask_p in tqdm(train_pairs, desc="Procesando Train"):
+        img = cv2_imread_unicode(img_p)
+        mask = cv2_imread_unicode(mask_p, cv2.IMREAD_GRAYSCALE)
+        if img is None or mask is None: continue
+
+        # Pipeline Preproceso
+        img = apply_clahe(img)
+        img = apply_denoise(img)
+        img, mask = align_brain(img, mask)
+
+        mask = (mask // 255).reshape(-1)
+        features, _ = extract_features(img)
+        features = features.astype(np.float32)
+
+        # Subsampling estrategico
+        idx_tumor = np.where(mask == 1)[0]
+        idx_backg = np.where(mask == 0)[0]
         
-        # Selección aleatoria del fondo
-        if n_backg > 0:
-            idx_backg_sample = np.random.choice(idx_backg, n_backg, replace=False)
-            indices_finales = np.concatenate([idx_tumor, idx_backg_sample])
-        else:
-            indices_finales = idx_tumor # Caso raro: imagen es todo tumor
-            
-    else:
-        # Si NO hay tumor, tomamos una muestra pequeña del fondo para que el modelo conozca tejidos sanos
-        # (ej. 2000 píxeles por imagen sana ~ 3% de una imagen 256x256)
-        n_sample = min(len(idx_backg), 2000)
-        indices_finales = np.random.choice(idx_backg, n_sample, replace=False)
-
-    # Filtrar DataFrame y Array de etiquetas
-    X_subset = features.iloc[indices_finales]
-    Y_subset = mask_flat[indices_finales]
-    
-    X_list.append(X_subset)
-    Y_list.append(Y_subset)
-
-end_time_extraction = time.time() # END TIMER
-print(f"Tiempo de extracción (Train): {end_time_extraction - start_time_extraction:.2f} segundos")
-
-# Liberar memoria explícitamente
-del img, mask, features, mask_flat, idx_tumor, idx_backg
-gc.collect()
-
-if len(X_list) == 0:
-    print("Error: No se pudieron cargar imágenes.")
-    exit()
-
-# Concatenar todos los datos
-print("Concatenando datos en memoria...")
-X_prev = pd.concat(X_list)
-Y_prev = np.concatenate(Y_list)
-
-print(f"Dataset de entrenamiento FINAL: {X_prev.shape[0]:,} píxeles")
-print(f"Distribución: No Tumor={np.sum(Y_prev==0):,}, Tumor={np.sum(Y_prev==1):,}")
-print(f"Uso de memoria estimado (X): {X_prev.memory_usage(deep=True).sum() / 1024**2:.2f} MB")
-
-# ==========================================
-# 5. CROSS-VALIDATION CON K-FOLD (k=7)
-# ==========================================
-
-print("\n--- Realizando Cross-Validation con K-Fold (k=7) ---")
-
-
-# Submuestreo para cross-validation (usar todos los píxeles es muy costoso)
-# Tomamos una muestra estratificada para CV
-sample_cv_size = min(100000, len(Y_prev))  # Máximo 100k píxeles para CV
-indices = np.random.choice(len(Y_prev), sample_cv_size, replace=False)
-X_cv = X_prev.iloc[indices]
-Y_cv = Y_prev[indices]
-
-print(f"Usando {sample_cv_size} píxeles para cross-validation")
-
-# Definir K-Fold
-start_time_cv = time.time()
-kfold = KFold(n_splits=7, shuffle=True, random_state=42)
-
-# Modelo para CV
-cv_model = RandomForestClassifier(
-    n_estimators=60,
-    max_depth=20,
-    min_samples_split=10,
-    min_samples_leaf=5,
-    n_jobs=-1,
-    random_state=42,
-    class_weight='balanced',
-    verbose=1
-)
-
-# Ejecutar cross-validation
-cv_scores = cross_val_score(cv_model, X_cv, Y_cv, cv=kfold, scoring='f1', n_jobs=-1)
-
-end_time_cv = time.time()
-
-print("\n" + "="*60)
-print("RESULTADOS CROSS-VALIDATION (7-Fold)")
-print("="*60)
-print(f"Píxeles analizados: {sample_cv_size:,}")
-print(f"Modelo: RandomForest (n_estimators=60, max_depth=20)")
-print(f"Métrica: F1-Score (Tumor)")
-print(f"Tiempo total: {end_time_cv - start_time_cv:.2f} segundos")
-
-print("\n" + "-"*60)
-print("F1-Scores por Fold:")
-print("-"*60)
-for i, score in enumerate(cv_scores, 1):
-    bar_length = int(score * 50)  # Barra visual de 50 caracteres máximo
-    bar = "█" * bar_length + "░" * (50 - bar_length)
-    print(f"  Fold {i:2d}: {score:.4f}  {bar}")
-
-print("\n" + "-"*60)
-print("Estadísticas Globales:")
-print("-"*60)
-print(f"  F1-Score Promedio : {cv_scores.mean():.4f}")
-print(f"  Desviación Estándar: {cv_scores.std():.4f}")
-print(f"  Intervalo Confianza: {cv_scores.mean():.4f} ± {cv_scores.std()*2:.4f} (95%)")
-print(f"  F1-Score Máximo   : {cv_scores.max():.4f} (Fold {np.argmax(cv_scores)+1})")
-print(f"  F1-Score Mínimo   : {cv_scores.min():.4f} (Fold {np.argmin(cv_scores)+1})")
-print(f"  Mediana           : {np.median(cv_scores):.4f}")
-print(f"  Rango             : {cv_scores.max() - cv_scores.min():.4f}")
-
-print("\n" + "-"*60)
-print("Interpretación:")
-print("-"*60)
-variance = cv_scores.std()
-if variance < 0.05:
-    stability = "✅ EXCELENTE - Modelo muy estable entre folds"
-elif variance < 0.10:
-    stability = "✓ BUENA - Varianza aceptable"
-else:
-    stability = "⚠ ALTA - Revisar distribución de datos o hiperparámetros"
-print(f"  Estabilidad: {stability}")
-
-avg_f1 = cv_scores.mean()
-if avg_f1 > 0.80:
-    performance = "✅ EXCELENTE - Detección de tumor muy precisa"
-elif avg_f1 > 0.60:
-    performance = "✓ BUENA - Detección aceptable"
-else:
-    performance = "⚠ MEJORABLE - Considerar más features o ajuste de parámetros"
-print(f"  Rendimiento: {performance}")
-
-print("="*60)
-
-# ==========================================
-# 6. ENTRENAMIENTO DEL MODELO FINAL
-# ==========================================
-print("\n--- Entrenando modelo final con todos los datos de train ---")
-
-start_time_train = time.time()
-
-print("\n--- Entrenando Random Forest... ---")
-# CAMBIO: Ajuste de pesos manual para reducir Falsos Positivos.
-# 'balanced' era muy agresivo (~1:3). Bajamos el peso del tumor a 1.5.
-model = RandomForestClassifier(
-    n_estimators=60,
-    max_depth=20,
-    min_samples_split=10,
-    min_samples_leaf=5,
-    n_jobs=-1,
-    random_state=42,
-    class_weight={0: 1, 1: 1.5},
-    verbose=1  # Mostrar progreso del entrenamiento
-)
-
-X = X_prev
-Y = Y_prev
-
-print(f"Configuración del modelo:")
-print(f"  - Estimadores: 60")
-print(f"  - Max Depth: 20")
-print(f"  - Características de entrada: {X.shape[1]}")
-print(f"  - Total de píxeles: {X.shape[0]:,}")
-
-model.fit(X, Y)
-
-end_time_train = time.time()
-
-print(f"\n--- Modelo Entrenado Exitosamente en {end_time_train - start_time_train:.2f} segundos ---")
-
-# Guardar referencias para compatibilidad con celdas posteriores
-subset_size = len(train_imgs)
-image_paths = train_imgs + test_imgs
-mask_paths = train_masks + test_masks
-
-# --- VISUALIZAR IMPORTANCIA DE FEATURES ---
-print("\n--- Importancia de Características ---")
-feature_names = X_prev.columns
-importances = model.feature_importances_
-indices = np.argsort(importances)[::-1]
-
-for f in range(len(feature_names)):
-    print(f"{f+1}. {feature_names[indices[f]]:20} : {importances[indices[f]]:.4f}")
-print("--------------------------------------")
-
-# ==========================================
-# 6. EVALUACIÓN Y VISUALIZACIÓN
-# ==========================================
-print(f"\n--- Probando predicción en {len(test_imgs)} imágenes de test ---")
-
-# Crear directorios para guardar resultados
-results_dir = os.path.join(PROJECT_ROOT, "results")
-
-# LIMPIEZA PREVIA: Borrar carpeta results antigua si existe
-if os.path.exists(results_dir):
-    import shutil
-    shutil.rmtree(results_dir)
-    print(f"Carpeta {results_dir} limpiada.")
-
-# Estructura de carpetas: TP se divide en High y Low Accuracy
-categories = ["TP", "TN", "FP", "FN"]
-for cat in categories:
-    os.makedirs(os.path.join(results_dir, cat), exist_ok=True)
-
-# Subcarpetas para TP
-# Se generarán dinámicamente según el Dice Score (00_10, 10_20...)
-os.makedirs(os.path.join(results_dir, "TP"), exist_ok=True)
-
-print(f"Los resultados se guardarán en: {results_dir}")
-
-# Acumuladores de métricas globales (Píxel a Píxel)
-all_true = []
-all_pred_raw = []
-all_pred_clean = []
-
-# Listas para métricas PROMEDIO (Por Imagen)
-tp_recalls = []   # Para guardar el % de acierto en casos TP
-tp_miss_rates = [] # Para guardar el % de fallo en casos TP
-fp_brain_ratios = [] # Para guardar el % de cerebro confundido en casos FP
-
-# Contadores para reporte de clasificación
-counts = {"TP": 0, "TN": 0, "FP": 0, "FN": 0}
-
-# Límite de visualización en pantalla
-DISPLAY_LIMIT = 10
-# Lista para guardar las figuras y mostrarlas al final
-figures_to_show = []
-
-print(f"Procesando {len(test_imgs)} imágenes (Visualizando primeras {DISPLAY_LIMIT})...\n")
-
-start_time_inference = time.time() # START TIMER
-
-for i in tqdm(range(len(test_imgs)), desc="Procesando Test Set"):
-    test_path = test_imgs[i]
-    test_mask_path = test_masks[i]
-    img_name = os.path.basename(test_path)
-    
-    img_test = cv2_imread_unicode(test_path, cv2.IMREAD_COLOR)
-    mask_real = cv2_imread_unicode(test_mask_path, cv2.IMREAD_GRAYSCALE)
-
-    mask_real = cv2_imread_unicode(test_mask_path, cv2.IMREAD_GRAYSCALE)
-
-    if img_test is None: continue
-
-    # --- PREPROCESAMIENTO NUEVO (CLAHE + DENOISE + ALINEACIÓN) ---
-    img_test = apply_clahe(img_test)
-    img_test = apply_denoise(img_test)
-    img_test, mask_real = align_brain(img_test, mask_real) # Alinear ambos
-
-    # Ground Truth a binario
-    mask_real_bin = (mask_real // 255).astype(np.uint8)
-
-    try:
-        # Predicción
-        features_test, shape_original = extract_features(img_test)
-        prediccion = model.predict(features_test)
+        counts_t = len(idx_tumor)
+        counts_b = len(idx_backg)
         
-        h, w = shape_original[0], shape_original[1]
-        matriz_raw = prediccion.reshape(h, w).astype(np.uint8)
-        
-        # ========================================
-        # PASO 3: LIMPIEZA DE BORDES (Skull Stripping + Eliminación de Cerebelo)
-        # ========================================
-        # IMPORTANTE: Necesitamos la máscara del cerebro para calcular métricas FP vs Brain
-        # Por eficiencia, la función eliminar_cerebelo_y_ruido ya calcula la máscara internamente,
-        # pero aquí la recalculamos rápido para tener el Área del Cerebro.
-        gray = cv2.cvtColor(img_test, cv2.COLOR_BGR2GRAY) if len(img_test.shape)==3 else img_test
-        ret, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        brain_area_pixels = 0
-        if len(contours) > 0:
-            brain_area_pixels = cv2.contourArea(max(contours, key=cv2.contourArea)) # Aprox del área cerebral
-
-        matriz_limpia = eliminar_cerebelo_y_ruido(img_test, matriz_raw)
-        
-        # Acumular para métricas globales
-        all_true.extend(mask_real_bin.flatten())
-        all_pred_raw.extend(matriz_raw.flatten())
-        all_pred_clean.extend(matriz_limpia.flatten())
-
-        # Métricas de esta imagen (Píxel a Píxel)
-        mets = calcular_metricas(mask_real_bin, matriz_limpia)
-
-        # --- CLASIFICACIÓN DE LA IMAGEN (TP, TN, FP, FN) ---
-        has_tumor = np.sum(mask_real_bin) > 0
-        detected = np.sum(matriz_limpia) > 0
-        
-        category = ""
-        save_folder = ""
-        extra_info = "" # Texto extra para el título
-        
-        if has_tumor and detected:
-            category = "TP"
-            # Calcular Recall específico de esta imagen (Acierto)
-            recall_img = mets["TP"] / (mets["TP"] + mets["FN"])
-            tp_recalls.append(recall_img)
-            tp_miss_rates.append(1 - recall_img)
-            
-            # Desglose TP por Deciles (10% en 10%)
-            # Binning basado en Dice Score (0.0 a 1.0)
-            dice_score = mets["Dice"]
-            
-            # Calcular bin: 0.0->0, 0.95->9, 1.0->9 (lo metemos en 90-100)
-            bin_idx = int(dice_score * 10)
-            if bin_idx >= 10: bin_idx = 9 # Cap en el último bin
-            
-            lower = bin_idx * 10
-            upper = (bin_idx + 1) * 10
-            
-            # Nombre de carpeta: Dice_00_10, Dice_90_100, etc.
-            folder_name = f"Dice_{lower:02d}_{upper:02d}"
-            save_folder = os.path.join(results_dir, "TP", folder_name)
-            os.makedirs(save_folder, exist_ok=True)
-            
-            cat_display = f"TP ({folder_name})"
-                
-            # Info extendida TP: Muestra Acierto, Perdido y EXCESO (FP)
-            extra_info = f"OK: {mets['TP']} | Miss: {mets['FN']} | Excess(FP): {mets['FP']}"
-            
-        elif not has_tumor and not detected:
-            category = "TN"
-            save_folder = os.path.join(results_dir, "TN")
-            cat_display = "TN"
-            
-        elif has_tumor and not detected:
-            category = "FN"
-            save_folder = os.path.join(results_dir, "FN")
-            cat_display = "FN"
-            
-        elif not has_tumor and detected:
-            category = "FP"
-            save_folder = os.path.join(results_dir, "FP")
-            cat_display = "FP"
-            
-            # Calcular ratio de FP vs Cerebro
-            if brain_area_pixels > 0:
-                fp_ratio = mets["FP"] / brain_area_pixels
-                fp_brain_ratios.append(fp_ratio)
-                extra_info = f"FP: {mets['FP']} px ({fp_ratio:.2%} del cerebro)"
+        sample_indices = []
+        if counts_t > 0:
+            # Tomar todo el tumor y 3x de fondo
+            needed_b = min(counts_b, counts_t * SUBSAMPLE_RATIO)
+            if needed_b > 0:
+                sample_indices = np.concatenate([
+                    idx_tumor, 
+                    np.random.choice(idx_backg, needed_b, replace=False)
+                ])
             else:
-                extra_info = f"FP: {mets['FP']} px"
+                sample_indices = idx_tumor
+        else:
+            # Imagen sana: tomar pequeña muestra representativa
+            sample_indices = np.random.choice(idx_backg, min(counts_b, 2000), replace=False)
+
+        X_train_list.append(features.iloc[sample_indices])
+        Y_train_list.append(mask[sample_indices])
+
+    print(f"    -> Tiempo Extracción: {time.time() - start_time:.1f}s")
+    
+    # Consolidar
+    X_train = pd.concat(X_train_list)
+    Y_train = np.concatenate(Y_train_list)
+    del X_train_list, Y_train_list
+    gc.collect()
+    
+    print(f"    -> Dataset Final: {len(X_train):,} píxeles.")
+    print(f"    -> Distribución: Tumor={np.sum(Y_train==1):,}, Fondo={np.sum(Y_train==0):,}")
+
+    # --- 3. Validación Cruzada ---
+    print(f"\n[3] Validación Cruzada (K-Fold={CV_FOLDS})...")
+    # Muestra reducida para CV rapido
+    cv_idx = np.random.choice(len(Y_train), min(100000, len(Y_train)), replace=False)
+    
+    rf_model = RandomForestClassifier(
+        n_estimators=RF_ESTIMATORS,
+        max_depth=RF_MAX_DEPTH,
+        class_weight=RF_CLASS_WEIGHT,
+        n_jobs=-1,
+        random_state=RANDOM_STATE,
+        verbose=0
+    )
+    
+    kfold = KFold(n_splits=CV_FOLDS, shuffle=True, random_state=RANDOM_STATE)
+    # Usamos cross_validate para obtener múltiples métricas
+    scoring_metrics = ['f1', 'precision', 'recall']
+    scores = cross_validate(rf_model, X_train.iloc[cv_idx], Y_train[cv_idx], cv=kfold, scoring=scoring_metrics, n_jobs=1)
+    
+    print(f"    -> Resultados por Fold:")
+    print(f"       {'Fold':<5} {'F1':<10} {'Precision':<10} {'Recall':<10}")
+    print(f"       {'-'*35}")
+    
+    for i in range(CV_FOLDS):
+        f1 = scores['test_f1'][i]
+        prec = scores['test_precision'][i]
+        rec = scores['test_recall'][i]
+        print(f"       {i+1:<5d} {f1:<10.4f} {prec:<10.4f} {rec:<10.4f}")
         
-        counts[category] += 1
+    print(f"       {'-'*35}")
+    print(f"    -> PROMEDIOS:")
+    print(f"       F1-Score  : {scores['test_f1'].mean():.4f} (+/- {scores['test_f1'].std()*2:.4f})")
+    print(f"       Precision : {scores['test_precision'].mean():.4f}")
+    print(f"       Recall    : {scores['test_recall'].mean():.4f}")
+    
+    stability = scores['test_f1'].std() < 0.05
+    print(f"    -> Estado: {'✅ ESTABLE' if stability else '⚠️ INESTABLE'}")
 
-        # Generar Figura
-        fig, axes = plt.subplots(2, 2, figsize=(14, 10))
-        # Título enriquecido
-        title_lines = [
-            f'[{cat_display}] {img_name}',
-            f'IoU: {mets["IoU"]:.2%} | Dice: {mets["Dice"]:.2%}',
-            extra_info if extra_info else mets["Note"]
-        ]
-        fig.suptitle("\n".join(title_lines), fontsize=14, fontweight='bold', y=0.98)
+    # --- 4. Entrenamiento Final ---
+    print(f"\n[4] Entrenando Modelo Final...")
+    rf_model.fit(X_train, Y_train)
+    
+    # Importancias
+    imps = rf_model.feature_importances_
+    feat_names = X_train.columns
+    sorted_idx = np.argsort(imps)[::-1]
+    
+    print("\n    -> IMPORTANCIA DE CARACTERÍSTICAS (Todas):")
+    print(f"       {'Ranking':<8} {'Feature':<20} {'Importancia':<10}")
+    print(f"       {'-'*40}")
+    for i in range(len(feat_names)):
+        idx = sorted_idx[i]
+        print(f"       {i+1:<8d} {feat_names[idx]:<20s} : {imps[idx]:.4f}")
 
-        # [1] Original
-        axes[0, 0].imshow(cv2.cvtColor(img_test, cv2.COLOR_BGR2RGB))
-        axes[0, 0].set_title(f'(1) Original')
-        axes[0, 0].axis('off')
+    # --- 5. Inferencia y Evaluación (Test) ---
+    print(f"\n[5] Evaluando en Test Set ({len(test_pairs)} imágenes)...")
+    results_dir = os.path.join(PROJECT_ROOT, "results")
+    limpiar_directorio_resultados(results_dir)
+    
+    global_metrics = {"TP":0, "FP":0, "FN":0, "TN":0}
+    img_counts = {"TP":0, "TN":0, "FP":0, "FN":0}
+    tp_qualities = [] # Dice scores
 
-        # [2] Mask Real
-        axes[0, 1].imshow(mask_real, cmap='gray')
-        axes[0, 1].set_title('(2) Mask Real')
-        if has_tumor:
-             axes[0, 1].text(0.5, -0.1, f'Tumor Real: {mets["TP"] + mets["FN"]:,} px', transform=axes[0,1].transAxes, ha='center')
-        axes[0, 1].axis('off')
-
-        # [3] Predicción Cruda
-        axes[1, 0].imshow(matriz_raw, cmap='Reds')
-        axes[1, 0].set_title('(3) Predicción Cruda')
-        pixels_raw = np.sum(matriz_raw)
-        axes[1, 0].text(0.5, -0.1, f'Raw Detect: {pixels_raw:,}', transform=axes[1,0].transAxes, ha='center')
-        axes[1, 0].axis('off')
-
-        # [4] Predicción Limpia
-        axes[1, 1].imshow(matriz_limpia, cmap='Reds')
-        axes[1, 1].set_title('(4) Predicción Limpia')
+    metrics_raw = {"TP":0, "FP":0, "FN":0} # Antes de limpiar
+    
+    total_cleaned_pixels = 0
+    
+    for img_p, mask_p in tqdm(test_pairs, desc="Inferencia"):
+        img_orig = cv2_imread_unicode(img_p)
+        mask_orig = cv2_imread_unicode(mask_p, cv2.IMREAD_GRAYSCALE)
+        fname = os.path.basename(img_p)
         
-        # Texto detallado TP/FP en el plot
-        res_text = f"Final: {mets['TP']+mets['FP']:,}"
-        if category == "TP":
-             # Aquí incluimos FP como parte del análisis de calidad (Exceso)
-             res_text += f"\n[OK] (TP): {mets['TP']:,}"
-             res_text += f"\n[MISS] (FN): {mets['FN']:,}"
-             res_text += f"\n[?] Excess (FP): {mets['FP']:,}"
-        elif category == "FP":
-             res_text += f"\n[!] Falsa Alarma: {mets['FP']:,} px"
-             
-        axes[1, 1].text(0.5, -0.15, res_text, transform=axes[1,1].transAxes, ha='center', color='red')
-        axes[1, 1].axis('off')
+        if img_orig is None: continue
 
+        # Preproceso Test
+        img = apply_clahe(img_orig)
+        img = apply_denoise(img)
+        img, mask = align_brain(img, mask_orig)
+        mask_bin = (mask // 255).astype(np.uint8)
+
+        # Prediccion
+        feat_df, (h, w) = extract_features(img)
+        pred_flat = rf_model.predict(feat_df)
+        pred_map = pred_flat.reshape(h, w).astype(np.uint8)
+        
+        # Guardar metricas RAW
+        m_raw = calcular_metricas(mask_bin, pred_map)
+        metrics_raw["FP"] += m_raw["FP"]
+
+        # Limpieza
+        clean_map = eliminar_cerebelo_y_ruido(img, pred_map)
+        
+        # Metricas FINALES
+        m_final = calcular_metricas(mask_bin, clean_map)
+        total_cleaned_pixels += (m_raw["FP"] - m_final["FP"])
+        
+        # Acumular globales
+        for k in global_metrics: global_metrics[k] += m_final[k]
+        
+        # Clasificar Imagen
+        has_tumor = np.sum(mask_bin) > 0
+        detected = np.sum(clean_map) > 0
+        cat = "TN"
+        if has_tumor and detected: cat = "TP"
+        elif has_tumor and not detected: cat = "FN"
+        elif not has_tumor and detected: cat = "FP"
+        
+        img_counts[cat] += 1
+        
+        # Guardar (Solo TP o errores FP/FN interesante guardar)
+        # Gestionar carpetas dinámicas para TP
+        save_subdir = cat
+        extra_txt = ""
+        
+        if cat == "TP":
+            dice = m_final["Dice"]
+            tp_qualities.append(dice)
+            decile = min(int(dice * 10), 9) * 10
+            save_subdir = os.path.join("TP", f"Dice_{decile:02d}_{decile+10:02d}")
+            os.makedirs(os.path.join(results_dir, save_subdir), exist_ok=True)
+            extra_txt = f"Dice: {dice:.2%}"
+        elif cat == "FP":
+            extra_txt = f"Ruido: {m_final['FP']} px"
+            
+        # Generar Plot (Solo guardar)
+        fig, axs = plt.subplots(1, 3, figsize=(12, 4))
+        fig.suptitle(f"[{cat}] {fname} | {extra_txt}")
+        axs[0].imshow(cv2.cvtColor(img, cv2.COLOR_BGR2RGB)); axs[0].set_title("Input (Aligned)")
+        axs[1].imshow(mask_bin, cmap='gray'); axs[1].set_title("Ground Truth")
+        axs[2].imshow(clean_map, cmap='Reds'); axs[2].set_title("Predicción AI")
+        for ax in axs: ax.axis('off')
+        
         plt.tight_layout()
-        
-        # GUARDAR IMAGEN
-        save_path = os.path.join(save_folder, f"Result_{img_name}.png")
-        plt.savefig(save_path)
-        
-        plt.close(fig) # Liberar memoria inmediatamente
+        plt.savefig(os.path.join(results_dir, save_subdir, f"res_{fname}.png"))
+        plt.close()
 
-    except Exception as e:
-        print(f"Error procesando {test_path}: {e}")
-        import traceback
-        traceback.print_exc()
-
-# ==========================================
-# 7. REPORTE FINAL GLOBAL DETALLADO
-# ==========================================
-print("\n" + "="*60)
-print("RESUMEN DE CLASIFICACIÓN (Por Imagen)")
-print("="*60)
-print(f"Total Imágenes Analizadas: {len(test_imgs)}")
-print(f"✅ TN (Sano Correcto)   : {counts['TN']:3d}")
-print(f"✅ TP (Tumor Detectado) : {counts['TP']:3d}")
-print(f"❌ FP (Falsa Alarma)    : {counts['FP']:3d}")
-print(f"❌ FN (Tumor Perdido)   : {counts['FN']:3d}")
-
-# Reporte de Promedios
-print("-" * 60)
-print("ANÁLISIS DE CALIDAD DE DETECCIÓN (Promedios por Imagen)")
-print("-" * 60)
-if len(tp_recalls) > 0:
-    avg_recall = np.mean(tp_recalls)
-    avg_miss = np.mean(tp_miss_rates)
-    print(f"PARA CASOS TP (Tumor Detectado):")
-    print(f"  - Promedio de Tumor Detectado: {avg_recall:.2%} (Calidad del acierto)")
-    print(f"  - Promedio de Tumor Perdido  : {avg_miss:.2%}")
-else:
-    print("No hubo casos TP para analizar promedios.")
-
-if len(fp_brain_ratios) > 0:
-    avg_fp_ratio = np.mean(fp_brain_ratios)
-    print(f"\nPARA CASOS FP (Falsos Positivos):")
-    print(f"  - Promedio de Cerebro confundido con Tumor: {avg_fp_ratio:.2%} del área cerebral")
-else:
-    print("\nNo hubo casos FP para analizar promedios.")
-    
-if len(all_true) > 0:
+    # --- 6. Reporte Final ---
     print("\n" + "="*60)
-    print("MÉTRICAS GLOBALES (A Nivel de Píxel)")
+    print("REPORTE FINAL DE EJECUCIÓN")
     print("="*60)
     
-    y_true_all = np.array(all_true)
-    y_raw_all = np.array(all_pred_raw)
-    y_clean_all = np.array(all_pred_clean)
+    # 1. Imagenes
+    n_test = len(test_pairs)
+    print("1. CLASIFICACIÓN DE IMÁGENES")
+    print(f"   Total: {n_test}")
+    print(f"   ✅ TP: {img_counts['TP']:3d} ({img_counts['TP']/n_test:6.2%}) - Detectados Correctamente")
+    print(f"   ✅ TN: {img_counts['TN']:3d} ({img_counts['TN']/n_test:6.2%}) - Sanos Correctos")
+    print(f"   ❌ FP: {img_counts['FP']:3d} ({img_counts['FP']/n_test:6.2%}) - Falsas Alarmas")
+    print(f"   ❌ FN: {img_counts['FN']:3d} ({img_counts['FN']/n_test:6.2%}) - Tumores Perdidos")
     
-    def print_comprehensive_metrics(title, true, pred):
-        m = calcular_metricas(true, pred)
-        total_pixels = len(true)
-        
-        print(f"\n[{title}]")
-        print("-" * 40)
-        # Matriz de Confusión
-        print(f"True Positives  (TP): {m['TP']:10,} ({m['TP']/total_pixels:.2%} del total)")
-        print(f"True Negatives  (TN): {m['TN']:10,} ({m['TN']/total_pixels:.2%} del total)")
-        print(f"False Positives (FP): {m['FP']:10,} ({m['FP']/total_pixels:.2%} del total) <--- RUIDO")
-        print(f"False Negatives (FN): {m['FN']:10,} ({m['FN']/total_pixels:.2%} del total) <--- TUMOR PERDIDO")
-        print("-" * 40)
-        # Scores
-        print(f"Accuracy : {m.get('Accuracy', (m['TP']+m['TN'])/total_pixels):.2%}")
-        print(f"Recall   : {m['Recall']:.2%}")
-        print(f"Precision: {m['Precision']:.2%}")
-        print(f"F1-Score : {m.get('F1', m['Dice']):.2%}")
-        print(f"IoU      : {m['IoU']:.2%}")
+    # 2. Calidad
+    print("\n2. CALIDAD DE SEGMENTACIÓN (Casos TP)")
+    if tp_qualities:
+        avg_dice = np.mean(tp_qualities)
+        print(f"   Dice Promedio: {avg_dice:.2%}")
+        # Histograma simple
+        hist, _ = np.histogram(tp_qualities, bins=[0, 0.5, 0.7, 0.9, 1.01])
+        print(f"   - Excelentes (>90%): {hist[3]}")
+        print(f"   - Buenos (70-90%):   {hist[2]}")
+        print(f"   - Regulares (50-70%):{hist[1]}")
+        print(f"   - Pobres (<50%):     {hist[0]}")
+    else:
+        print("   (No hubo casos TP)")
 
-        return m
-
-    m_raw = print_comprehensive_metrics("PREDICCIÓN CRUDA (Sin Filtros)", y_true_all, y_raw_all)
-    m_clean = print_comprehensive_metrics("PREDICCIÓN FINAL (Skull Stripping)", y_true_all, y_clean_all)
+    # 3. Pixeles
+    print("\n3. PRECISIÓN QUIRÚRGICA (Píxeles)")
+    tot_p = global_metrics["TP"] + global_metrics["FN"]
+    tot_det = global_metrics["TP"] + global_metrics["FP"]
     
-    print("\n" + "="*60)
-    print("MEJORA DE LIMPIEZA")
-    print("="*60)
-    fp_reduction = m_raw['FP'] - m_clean['FP']
-    print(f"Falsos Positivos ELIMINADOS: {fp_reduction:,}")
-    if m_raw['FP'] > 0:
-        print(f"Reducción de Ruido: {(fp_reduction/m_raw['FP']):.2%}")
-
-end_time_inference = time.time() # END TIMER
-total_inference_time = end_time_inference - start_time_inference
-avg_inference_time = total_inference_time / len(test_imgs) if len(test_imgs) > 0 else 0
-
-print("\n" + "="*60)
-print("VALIDACIÓN CRUZADA (K-FOLD) - RESUMEN")
-print("="*60)
-print(f"F1-Score Promedio (7-Fold): {cv_scores.mean():.4f} ± {cv_scores.std():.4f}")
-print(f"Rango de Scores: [{cv_scores.min():.4f} - {cv_scores.max():.4f}]")
-print(f"Mediana: {np.median(cv_scores):.4f}")
-print(f"Tiempo Cross-Validation: {end_time_cv - start_time_cv:.2f} s")
-if cv_scores.std() < 0.05:
-    print("Estabilidad del Modelo: ✅ EXCELENTE (Baja varianza entre folds)")
-elif cv_scores.std() < 0.10:
-    print("Estabilidad del Modelo: ✓ BUENA (Varianza aceptable)")
-else:
-    print("Estabilidad del Modelo: ⚠ REVISAR (Alta varianza entre folds)")
-
-print("\n" + "="*60)
-print("TIEMPOS DE EJECUCIÓN")
-print("="*60)
-print(f"Extracción Features (Train): {end_time_extraction - start_time_extraction:.2f} s")
-print(f"Cross-Validation (7-Fold) : {end_time_cv - start_time_cv:.2f} s")
-print(f"Entrenamiento Modelo Final : {end_time_train - start_time_train:.2f} s")
-print(f"Inferencia Total (Test)    : {total_inference_time:.2f} s")
-print(f"Inferencia Promedio/Img    : {avg_inference_time:.4f} s ({1/avg_inference_time:.1f} FPS)")
-print(f"TIEMPO TOTAL PIPELINE      : {end_time_extraction - start_time_extraction + end_time_cv - start_time_cv + end_time_train - start_time_train + total_inference_time:.2f} s")
-
-print("\nProceso guardado completado. Resultados en 'results/'")
-print("\n--- FIN DEL DIAGNÓSTICO ---")
+    sens = global_metrics["TP"] / tot_p if tot_p > 0 else 0
+    conf = global_metrics["TP"] / tot_det if tot_det > 0 else 0
+    
+    print(f"   Sensibilidad (Recall): {sens:6.2%} (Tumor real encontrado)")
+    print(f"   Confianza (Precision): {conf:6.2%} (Píxeles rojos que son tumor)")
+    print(f"   Ruido Eliminado:       {total_cleaned_pixels:,} píxeles")
+    
+    print("\n[FIN] Resultados guardados en 'results/'")
