@@ -174,3 +174,119 @@
 
 ============================================================
 
+## 🧪 Prueba: 2025-12-14 20:27:16
+### 1. Configuración del Experimento
+- **Dataset:** 500 imágenes (Train: 400, Test: 100)
+- **Random Forest:** `Estimators=100`, `Depth=30`, `ClassWeight={0: 1, 1: 1.5}`
+- **Tiempos:** Extrac=15.8s | CV=30.5s | Train=117.3s | Inf=54.9s | **Total=219.2s**
+
+### 2. Validación Cruzada (K=7) - Estabilidad
+| Fold | F1-Score | Precision | Recall |
+|------|----------|-----------|--------|
+| 1 | 0.8997 | 0.9235 | 0.8771 |
+| 2 | 0.8846 | 0.9077 | 0.8626 |
+| 3 | 0.8946 | 0.9077 | 0.8819 |
+| 4 | 0.9002 | 0.9188 | 0.8823 |
+| 5 | 0.8881 | 0.9094 | 0.8677 |
+| 6 | 0.8949 | 0.9140 | 0.8767 |
+| 7 | 0.8935 | 0.9064 | 0.8811 |
+| **Promedio** | **0.8937** ± 0.0106 | 0.9125 | 0.8756 |
+
+### 3. Importancia de Características (Top Influencias)
+| Ranking | Característica | Importancia | Descripción |
+|:-------:|----------------|-------------|-------------|
+| 1 | **A** | 0.1432 | Canal A (LAB) - Rojo/Verde |
+| 2 | **Green_Excess** | 0.1400 | Índice de 'Verdosidad' (G - (R+B)/2) |
+| 3 | **Green_Texture** | 0.0996 | Interacción Verde * Textura |
+| 4 | Spatial_Radial | 0.0986 | Distancia al centro del cerebro |
+| 5 | B_lab | 0.0626 | Canal B (LAB) - Azul/Amarillo |
+| 6 | Gaussian | 0.0550 | - |
+| 7 | G | 0.0540 | - |
+| 8 | Spatial_X | 0.0461 | - |
+| 9 | L | 0.0404 | - |
+| 10 | Spatial_Y | 0.0357 | - |
+| 11 | B | 0.0348 | - |
+| 12 | S | 0.0331 | - |
+| 13 | H | 0.0325 | - |
+| 14 | R | 0.0318 | - |
+| 15 | Texture_LocalStd | 0.0302 | Complejidad/Rugosidad local |
+| 16 | V | 0.0241 | - |
+| 17 | Symmetry | 0.0187 | Diferencia entre hemisferios |
+| 18 | Sobel_Mag | 0.0184 | - |
+| 19 | Canny | 0.0010 | - |
+
+### 4. Resultados Finales (Test Set - 100 imágenes)
+#### 📊 Clasificación de Imágenes
+- ✅ **TP (Detectados):** 32 imágenes - *El modelo encontró el tumor correctamente.*
+- ✅ **TN (Sanos):** 35 imágenes - *El modelo confirmó que estaba sano.*
+- ❌ **FP (Falsas Alarmas):** 32 imágenes - *El modelo vio tumor donde no había.*
+- ❌ **FN (Perdidos):** 1 imágenes - *El modelo NO vio el tumor existente.*
+
+#### 🎯 Precisión Quirúrgica (Píxel a Píxel)
+- **Sensibilidad (Recall):** `74.30%`
+  > De todo el tejido tumoral real, el modelo detectó este porcentaje.
+- **Confianza (Precision):** `58.22%`
+  > De todo lo que el modelo marcó en rojo, este porcentaje era realmente tumor.
+- **Calidad de Segmentación (Dice):** `69.64%`
+- **Limpieza de Ruido:** Se eliminaron **58,477** píxeles de falsas alarmas durante el post-proceso.
+
+============================================================
+
+## 🧪 Prueba: 2025-12-14 21:00:00
+### 1. Configuración del Experimento
+- **Dataset:** 3929 imágenes (Train: 3143, Test: 786)
+- **Random Forest:** `Estimators=100`, `Depth=30`, `ClassWeight={0: 1, 1: 1.5}`
+- **Tiempos:** Extrac=110.9s | CV=26.0s | Train=1269.0s | Inf=493.7s | **Total=1902.2s**
+
+### 2. Validación Cruzada (K=7) - Estabilidad
+| Fold | F1-Score | Precision | Recall |
+|------|----------|-----------|--------|
+| 1 | 0.8576 | 0.8884 | 0.8288 |
+| 2 | 0.8595 | 0.8929 | 0.8285 |
+| 3 | 0.8442 | 0.8947 | 0.7991 |
+| 4 | 0.8570 | 0.8886 | 0.8276 |
+| 5 | 0.8588 | 0.8970 | 0.8239 |
+| 6 | 0.8644 | 0.8878 | 0.8422 |
+| 7 | 0.8586 | 0.8945 | 0.8254 |
+| **Promedio** | **0.8572** ± 0.0115 | 0.8920 | 0.8251 |
+
+### 3. Importancia de Características (Top Influencias)
+| Ranking | Característica | Importancia | Descripción |
+|:-------:|----------------|-------------|-------------|
+| 1 | **Green_Excess** | 0.1472 | Índice de 'Verdosidad' (G - (R+B)/2) |
+| 2 | **A** | 0.1458 | Canal A (LAB) - Rojo/Verde |
+| 3 | **Green_Texture** | 0.1060 | Interacción Verde * Textura |
+| 4 | Spatial_Radial | 0.0891 | Distancia al centro del cerebro |
+| 5 | B_lab | 0.0852 | Canal B (LAB) - Azul/Amarillo |
+| 6 | Gaussian | 0.0528 | - |
+| 7 | G | 0.0507 | - |
+| 8 | Spatial_X | 0.0446 | - |
+| 9 | L | 0.0382 | - |
+| 10 | Spatial_Y | 0.0343 | - |
+| 11 | B | 0.0340 | - |
+| 12 | Texture_LocalStd | 0.0315 | Complejidad/Rugosidad local |
+| 13 | H | 0.0280 | - |
+| 14 | S | 0.0272 | - |
+| 15 | R | 0.0267 | - |
+| 16 | V | 0.0213 | - |
+| 17 | Symmetry | 0.0197 | Diferencia entre hemisferios |
+| 18 | Sobel_Mag | 0.0168 | - |
+| 19 | Canny | 0.0010 | - |
+
+### 4. Resultados Finales (Test Set - 786 imágenes)
+#### 📊 Clasificación de Imágenes
+- ✅ **TP (Detectados):** 265 imágenes - *El modelo encontró el tumor correctamente.*
+- ✅ **TN (Sanos):** 271 imágenes - *El modelo confirmó que estaba sano.*
+- ❌ **FP (Falsas Alarmas):** 239 imágenes - *El modelo vio tumor donde no había.*
+- ❌ **FN (Perdidos):** 11 imágenes - *El modelo NO vio el tumor existente.*
+
+#### 🎯 Precisión Quirúrgica (Píxel a Píxel)
+- **Sensibilidad (Recall):** `82.01%`
+  > De todo el tejido tumoral real, el modelo detectó este porcentaje.
+- **Confianza (Precision):** `59.04%`
+  > De todo lo que el modelo marcó en rojo, este porcentaje era realmente tumor.
+- **Calidad de Segmentación (Dice):** `70.11%`
+- **Limpieza de Ruido:** Se eliminaron **493,565** píxeles de falsas alarmas durante el post-proceso.
+
+============================================================
+
