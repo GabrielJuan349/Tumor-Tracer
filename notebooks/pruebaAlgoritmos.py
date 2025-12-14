@@ -31,6 +31,8 @@ from tqdm import tqdm
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.model_selection import train_test_split, cross_val_score, KFold, cross_validate
 from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score
+import datetime
+
 
 # Configurar backend no interactivo para estabilidad en Windows
 matplotlib.use('Agg')
@@ -40,8 +42,8 @@ matplotlib.use('Agg')
 # 1. CONFIGURACIÓN Y CONSTANTES
 # ==========================================
 RANDOM_STATE = 42
-RF_ESTIMATORS = 60
-RF_MAX_DEPTH = 20
+RF_ESTIMATORS = 100
+RF_MAX_DEPTH = 30
 RF_CLASS_WEIGHT = {0: 1, 1: 1.5} # Peso 1.5 a Tumor para priorizar sensibilidad sin disparar FPs
 SUBSAMPLE_RATIO = 3  # Ratio 1 pixel tumor : 3 pixeles fondo
 CV_FOLDS = 7
@@ -70,6 +72,71 @@ def limpiar_directorio_resultados(path):
     
     # Subcarpetas TP por calidad (Deciles) se crean dinámicamente luego
     print(f"Directorio de resultados preparado: {path}")
+
+def log_experiment_to_md(params, metrics, timings, cv_full, feat_imps, filename="experiment_history.md"):
+    """Guarda los resultados del experimento en un archivo Markdown persistente."""
+    path = os.path.join(PROJECT_ROOT, filename)
+    mode = 'a' if os.path.exists(path) else 'w'
+    
+    timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    
+    with open(path, mode, encoding='utf-8') as f:
+        if mode == 'w':
+            f.write("# Historial de Experimentos - Tumor Tracer AI\n\n")
+        
+        f.write(f"## 🧪 Prueba: {timestamp}\n")
+        f.write(f"### 1. Configuración del Experimento\n")
+        f.write(f"- **Dataset:** {params['n_images']} imágenes (Train: {params['n_train']}, Test: {params['n_test']})\n")
+        f.write(f"- **Random Forest:** `Estimators={params['rf_est']}`, `Depth={params['rf_depth']}`, `ClassWeight={params['rf_weight']}`\n")
+        f.write(f"- **Tiempos:** Extrac={timings['extraction']:.1f}s | CV={timings['cv']:.1f}s | Train={timings['train']:.1f}s | Inf={timings['inference']:.1f}s | **Total={timings['total']:.1f}s**\n")
+        
+        f.write(f"\n### 2. Validación Cruzada (K={CV_FOLDS}) - Estabilidad\n")
+        f.write(f"| Fold | F1-Score | Precision | Recall |\n")
+        f.write(f"|------|----------|-----------|--------|\n")
+        for i in range(CV_FOLDS):
+            f.write(f"| {i+1} | {cv_full['test_f1'][i]:.4f} | {cv_full['test_precision'][i]:.4f} | {cv_full['test_recall'][i]:.4f} |\n")
+        
+        f.write(f"| **Promedio** | **{metrics['cv_f1_mean']:.4f}** ± {metrics['cv_f1_std']*2:.4f} | {metrics['cv_prec_mean']:.4f} | {metrics['cv_rec_mean']:.4f} |\n")
+        
+        f.write(f"\n### 3. Importancia de Características (Top Influencias)\n")
+        f.write(f"| Ranking | Característica | Importancia | Descripción |\n")
+        f.write(f"|:-------:|----------------|-------------|-------------|\n")
+        
+        # Diccionario de descripciones breves
+        desc_map = {
+            "Green_Excess": "Índice de 'Verdosidad' (G - (R+B)/2)",
+            "Green_Texture": "Interacción Verde * Textura",
+            "Spatial_Radial": "Distancia al centro del cerebro",
+            "A": "Canal A (LAB) - Rojo/Verde",
+            "B_lab": "Canal B (LAB) - Azul/Amarillo",
+            "Texture_LocalStd": "Complejidad/Rugosidad local",
+            "Symmetry": "Diferencia entre hemisferios"
+        }
+        
+        for i, (name, imp) in enumerate(feat_imps):
+            desc = desc_map.get(name, "-")
+            bold = "**" if i < 3 else ""
+            f.write(f"| {i+1} | {bold}{name}{bold} | {imp:.4f} | {desc} |\n")
+            
+        f.write(f"\n### 4. Resultados Finales (Test Set - {params['n_test']} imágenes)\n")
+        f.write(f"#### 📊 Clasificación de Imágenes\n")
+        f.write(f"- ✅ **TP (Detectados):** {metrics['TP']} imágenes - *El modelo encontró el tumor correctamente.*\n")
+        f.write(f"- ✅ **TN (Sanos):** {metrics['TN']} imágenes - *El modelo confirmó que estaba sano.*\n")
+        f.write(f"- ❌ **FP (Falsas Alarmas):** {metrics['FP']} imágenes - *El modelo vio tumor donde no había.*\n")
+        f.write(f"- ❌ **FN (Perdidos):** {metrics['FN']} imágenes - *El modelo NO vio el tumor existente.*\n")
+        
+        f.write(f"\n#### 🎯 Precisión Quirúrgica (Píxel a Píxel)\n")
+        f.write(f"- **Sensibilidad (Recall):** `{metrics['Recall']:.2%}`\n")
+        f.write(f"  > De todo el tejido tumoral real, el modelo detectó este porcentaje.\n")
+        f.write(f"- **Confianza (Precision):** `{metrics['Precision']:.2%}`\n")
+        f.write(f"  > De todo lo que el modelo marcó en rojo, este porcentaje era realmente tumor.\n")
+        f.write(f"- **Calidad de Segmentación (Dice):** `{metrics['Dice']:.2%}`\n")
+        f.write(f"- **Limpieza de Ruido:** Se eliminaron **{metrics['NoiseReduced']:,}** píxeles de falsas alarmas durante el post-proceso.\n")
+        
+        f.write("\n" + "="*60 + "\n\n")
+    
+    print(f"\n[HISTORIAL] Resultados detallados guardados en: {filename}")
+
 
 # ==========================================
 # 3. FUNCIONES DE PREPROCESAMIENTO
@@ -269,7 +336,11 @@ def calcular_metricas(y_true, y_pred):
 # 6. PIPELINE PRINCIPAL (MAIN)
 # ==========================================
 if __name__ == "__main__":
+    t_start_total = time.time()
+    timings = {}
+    
     BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
     PROJECT_ROOT = os.path.dirname(BASE_DIR)
     
     print("\n=== INICIANDO PIPELINE DE DETECCIÓN DE TUMORES ===")
@@ -302,6 +373,7 @@ if __name__ == "__main__":
             valid_pairs.append((img_p, mask_p))
 
     # Selección Aleatoria
+    # sample_size = min(3929, len(valid_pairs)) # User requested all
     sample_size = min(500, len(valid_pairs))
     random.seed(RANDOM_STATE)
     selected = random.sample(valid_pairs, sample_size)
@@ -313,6 +385,7 @@ if __name__ == "__main__":
 
     # --- 2. Extracción de Features (Entrenamiento) ---
     print(f"\n[2] Extracción de Características (Train)...")
+    t_start_extract = time.time()
     X_train_list, Y_train_list = [], []
     
     start_time = time.time()
@@ -355,7 +428,9 @@ if __name__ == "__main__":
         X_train_list.append(features.iloc[sample_indices])
         Y_train_list.append(mask[sample_indices])
 
-    print(f"    -> Tiempo Extracción: {time.time() - start_time:.1f}s")
+    time_extract = time.time() - t_start_extract
+    timings['extraction'] = time_extract
+    print(f"    -> Tiempo Extracción: {time_extract:.1f}s")
     
     # Consolidar
     X_train = pd.concat(X_train_list)
@@ -368,6 +443,7 @@ if __name__ == "__main__":
 
     # --- 3. Validación Cruzada ---
     print(f"\n[3] Validación Cruzada (K-Fold={CV_FOLDS})...")
+    t_start_cv = time.time()
     # Muestra reducida para CV rapido
     cv_idx = np.random.choice(len(Y_train), min(100000, len(Y_train)), replace=False)
     
@@ -379,6 +455,7 @@ if __name__ == "__main__":
         random_state=RANDOM_STATE,
         verbose=0
     )
+
     
     kfold = KFold(n_splits=CV_FOLDS, shuffle=True, random_state=RANDOM_STATE)
     # Usamos cross_validate para obtener múltiples métricas
@@ -404,21 +481,34 @@ if __name__ == "__main__":
     stability = scores['test_f1'].std() < 0.05
     print(f"    -> Estado: {'✅ ESTABLE' if stability else '⚠️ INESTABLE'}")
 
+    time_cv = time.time() - t_start_cv
+    timings['cv'] = time_cv
+
     # --- 4. Entrenamiento Final ---
     print(f"\n[4] Entrenando Modelo Final...")
+    t_start_train = time.time()
     rf_model.fit(X_train, Y_train)
+    time_train = time.time() - t_start_train
+    timings['train'] = time_train
+
     
     # Importancias
     imps = rf_model.feature_importances_
     feat_names = X_train.columns
     sorted_idx = np.argsort(imps)[::-1]
     
+    # Guardar lista de features para el reporte
+    feature_importance_list = []
+    
     print("\n    -> IMPORTANCIA DE CARACTERÍSTICAS (Todas):")
     print(f"       {'Ranking':<8} {'Feature':<20} {'Importancia':<10}")
     print(f"       {'-'*40}")
     for i in range(len(feat_names)):
         idx = sorted_idx[i]
-        print(f"       {i+1:<8d} {feat_names[idx]:<20s} : {imps[idx]:.4f}")
+        name = feat_names[idx]
+        val = imps[idx]
+        feature_importance_list.append((name, val))
+        print(f"       {i+1:<8d} {name:<20s} : {val:.4f}")
 
     # --- 5. Inferencia y Evaluación (Test) ---
     print(f"\n[5] Evaluando en Test Set ({len(test_pairs)} imágenes)...")
@@ -433,7 +523,9 @@ if __name__ == "__main__":
     
     total_cleaned_pixels = 0
     
+    t_start_inf = time.time()
     for img_p, mask_p in tqdm(test_pairs, desc="Inferencia"):
+
         img_orig = cv2_imread_unicode(img_p)
         mask_orig = cv2_imread_unicode(mask_p, cv2.IMREAD_GRAYSCALE)
         fname = os.path.basename(img_p)
@@ -502,6 +594,10 @@ if __name__ == "__main__":
         plt.savefig(os.path.join(results_dir, save_subdir, f"res_{fname}.png"))
         plt.close()
 
+    time_inf = time.time() - t_start_inf
+    timings['inference'] = time_inf
+    timings['total'] = time.time() - t_start_total
+
     # --- 6. Reporte Final ---
     print("\n" + "="*60)
     print("REPORTE FINAL DE EJECUCIÓN")
@@ -511,22 +607,16 @@ if __name__ == "__main__":
     n_test = len(test_pairs)
     print("1. CLASIFICACIÓN DE IMÁGENES")
     print(f"   Total: {n_test}")
-    print(f"   ✅ TP: {img_counts['TP']:3d} ({img_counts['TP']/n_test:6.2%}) - Detectados Correctamente")
-    print(f"   ✅ TN: {img_counts['TN']:3d} ({img_counts['TN']/n_test:6.2%}) - Sanos Correctos")
-    print(f"   ❌ FP: {img_counts['FP']:3d} ({img_counts['FP']/n_test:6.2%}) - Falsas Alarmas")
-    print(f"   ❌ FN: {img_counts['FN']:3d} ({img_counts['FN']/n_test:6.2%}) - Tumores Perdidos")
+    print(f"   ✅ TP: {img_counts['TP']:3d} ({img_counts['TP']/n_test:6.2%})")
+    print(f"   ✅ TN: {img_counts['TN']:3d} ({img_counts['TN']/n_test:6.2%})")
+    print(f"   ❌ FP: {img_counts['FP']:3d} ({img_counts['FP']/n_test:6.2%})")
+    print(f"   ❌ FN: {img_counts['FN']:3d} ({img_counts['FN']/n_test:6.2%})")
     
     # 2. Calidad
     print("\n2. CALIDAD DE SEGMENTACIÓN (Casos TP)")
+    avg_dice = np.mean(tp_qualities) if tp_qualities else 0.0
     if tp_qualities:
-        avg_dice = np.mean(tp_qualities)
         print(f"   Dice Promedio: {avg_dice:.2%}")
-        # Histograma simple
-        hist, _ = np.histogram(tp_qualities, bins=[0, 0.5, 0.7, 0.9, 1.01])
-        print(f"   - Excelentes (>90%): {hist[3]}")
-        print(f"   - Buenos (70-90%):   {hist[2]}")
-        print(f"   - Regulares (50-70%):{hist[1]}")
-        print(f"   - Pobres (<50%):     {hist[0]}")
     else:
         print("   (No hubo casos TP)")
 
@@ -538,8 +628,38 @@ if __name__ == "__main__":
     sens = global_metrics["TP"] / tot_p if tot_p > 0 else 0
     conf = global_metrics["TP"] / tot_det if tot_det > 0 else 0
     
-    print(f"   Sensibilidad (Recall): {sens:6.2%} (Tumor real encontrado)")
-    print(f"   Confianza (Precision): {conf:6.2%} (Píxeles rojos que son tumor)")
+    print(f"   Sensibilidad (Recall): {sens:6.2%}")
+    print(f"   Confianza (Precision): {conf:6.2%}")
     print(f"   Ruido Eliminado:       {total_cleaned_pixels:,} píxeles")
+    
+    # 4. Tiempos
+    print("\n4. TIEMPOS DE EJECUCIÓN")
+    print(f"   Extracción (Train): {timings['extraction']:.2f} s")
+    print(f"   Cross-Validation:   {timings['cv']:.2f} s")
+    print(f"   Entrenamiento:      {timings['train']:.2f} s")
+    print(f"   Inferencia (Test):  {timings['inference']:.2f} s")
+    print(f"   TOTAL SCRIPT:       {timings['total']:.2f} s")
+
+    # --- LOG A MARKDOWN ---
+    params = {
+        'n_images': len(selected),
+        'n_train': len(train_pairs),
+        'n_test': len(test_pairs),
+        'rf_est': RF_ESTIMATORS,
+        'rf_depth': RF_MAX_DEPTH,
+        'rf_weight': str(RF_CLASS_WEIGHT)
+    }
+    
+    metrics = {
+        'TP': img_counts['TP'], 'TN': img_counts['TN'], 'FP': img_counts['FP'], 'FN': img_counts['FN'],
+        'Recall': sens, 'Precision': conf, 'Dice': avg_dice,
+        'NoiseReduced': total_cleaned_pixels,
+        'cv_f1_mean': scores['test_f1'].mean(),
+        'cv_f1_std': scores['test_f1'].std(),
+        'cv_prec_mean': scores['test_precision'].mean(),
+        'cv_rec_mean': scores['test_recall'].mean()
+    }
+    
+    log_experiment_to_md(params, metrics, timings, scores, feature_importance_list)
     
     print("\n[FIN] Resultados guardados en 'results/'")
