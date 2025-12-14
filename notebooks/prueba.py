@@ -328,6 +328,8 @@ def extract_features(img):
     # entropy_img = entropy(img_gray, disk(3)) # Lento en CPU single thread para imágenes 512x512
     # Usaremos desviación estándar local como proxy rápido de "Complejidad de Textura"
     
+
+    
     # Textura: Desviación Estándar Local (Kernel 5x5)
     mean, std_dev = cv2.meanStdDev(img_gray) # Global, no sirve
     
@@ -339,6 +341,13 @@ def extract_features(img):
     sigma = np.sqrt(np.maximum(mu2 - mu**2, 0))
     
     df['Texture_LocalStd'] = sigma.reshape(-1)
+
+    # --- Feature de Interacción (Green * Texture) ---
+    # Hipótesis: Ruido verde es liso (Baja textura). Tumor verde es rugoso (Alta textura).
+    # Multiplicamos Green_Excess por Textura.
+    # Si es verde y rugoso -> Valor Alto (Probable Tumor)
+    # Si es verde y liso -> Valor Bajo/Negativo
+    df['Green_Texture'] = df['Green_Excess'] * df['Texture_LocalStd']
 
     # Nota: Si el usuario exige GLCM Haralick real, requeriría una implementación optimizada en C++ o 
     # usar features de parches grandes. Para píxel a píxel, Local Std Dev + Sobel + Entropy es el estándar rápido.
@@ -494,7 +503,8 @@ print(f"Uso de memoria estimado (X): {X_prev.memory_usage(deep=True).sum() / 102
 # 5. ENTRENAMIENTO DEL MODELO
 # ==========================================
 print("\n--- Entrenando Random Forest... ---")
-# Nota: class_weight sigue siendo útil aunque hayamos balanceado un poco
+# CAMBIO: Ajuste de pesos manual para reducir Falsos Positivos.
+# 'balanced' era muy agresivo (~1:3). Bajamos el peso del tumor a 1.5.
 model = RandomForestClassifier(
     n_estimators=60,
     max_depth=20,
@@ -502,7 +512,7 @@ model = RandomForestClassifier(
     min_samples_leaf=5,
     n_jobs=-1,
     random_state=42,
-    class_weight='balanced',
+    class_weight={0: 1, 1: 1.5}, 
     verbose=0 
 )
 
@@ -516,6 +526,16 @@ model.fit(X_prev, Y_prev)
 end_time_train = time.time() # END TIMER
 
 print(f"¡Modelo entrenado exitosamente en {end_time_train - start_time_train:.2f} segundos!")
+
+# --- VISUALIZAR IMPORTANCIA DE FEATURES ---
+print("\n--- Importancia de Características ---")
+feature_names = X_prev.columns
+importances = model.feature_importances_
+indices = np.argsort(importances)[::-1]
+
+for f in range(len(feature_names)):
+    print(f"{f+1}. {feature_names[indices[f]]:20} : {importances[indices[f]]:.4f}")
+print("--------------------------------------")
 
 # ==========================================
 # 6. EVALUACIÓN Y VISUALIZACIÓN
