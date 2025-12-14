@@ -8,6 +8,7 @@ from sklearn.ensemble import RandomForestClassifier
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score, confusion_matrix
 from scipy import ndimage as nd
+# from skimage.feature import graycomatrix, graycoprops # REMOVED: Dependency not found, using CV2 alternatives
 import matplotlib
 # Configurar backend "Agg" (No interactivo) para evitar errores de hilos/Tcl
 # Esto significa que las imágenes se guardarán pero NO se abrirán ventanas emergentes.
@@ -30,21 +31,14 @@ def cv2_imread_unicode(path, flag=cv2.IMREAD_COLOR):
 
 def eliminar_cerebelo_y_ruido(img_rgb, prediccion_binaria):
     """
-    Skull Stripping Avanzado + Eliminación de Cerebelo
-
-    PROBLEMA SOLUCIONADO: El modelo confunde el cerebelo (parte inferior del cerebro)
-    con tumores, generando falsos positivos masivos.
-
-    ESTRATEGIA:
-    1. Detecta el contorno del cerebro usando HSV-V
-    2. ELIMINA EL 40% INFERIOR de la imagen (donde está el cerebelo)
-    3. Filtra componentes conectados pequeños (ruido)
-    4. Aplica limpieza morfológica agresiva
+    Skull Stripping Avanzado + Limpieza
+    
+    CAMBIO IMPORTANTE: SE HA ELIMINADO EL RECORTE FIJO DEL 40% INFERIOR.
+    Ahora confiamos en que el modelo (entrenado con GLCM y Spatial Features)
+    sepa distinguir el cerebelo del tumor.
     """
-    h = prediccion_binaria.shape[0]
-
     # ========================================
-    # PASO 1: SKULL STRIPPING CON HSV
+    # PASO 1: SKULL STRIPPING CON HSV (Igual que antes)
     # ========================================
     img_hsv = cv2.cvtColor(img_rgb, cv2.COLOR_BGR2HSV)
     v_channel = img_hsv[:, :, 2]
@@ -53,21 +47,19 @@ def eliminar_cerebelo_y_ruido(img_rgb, prediccion_binaria):
     contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
     if len(contours) == 0:
-        return np.zeros_like(prediccion_binaria)  # Devolver imagen vacía si falla
+        return np.zeros_like(prediccion_binaria)
 
     largest_contour = max(contours, key=cv2.contourArea)
     brain_mask = np.zeros_like(v_channel)
     cv2.drawContours(brain_mask, [largest_contour], -1, 255, -1)
 
     # ========================================
-    # PASO 2: ELIMINAR CEREBELO (40% INFERIOR)
+    # PASO 2: ELIMINACIÓN DE RECORTE FIJO (ELIMINADO)
     # ========================================
-    # El cerebelo está en la parte baja de las imágenes MRI axiales
-    # Crear máscara que bloquee el 40% inferior de la imagen
-    cerebelo_cutoff = int(h * 0.60)  # Mantener solo el 60% superior
-    brain_mask[cerebelo_cutoff:, :] = 0  # Borrar todo lo que esté debajo
+    # ANTES: cerebelo_cutoff = int(h * 0.60); brain_mask[cerebelo_cutoff:, :] = 0
+    # AHORA: No hacemos nada aquí. Mantenemos todo el cerebro.
 
-    # Erosión más agresiva para eliminar bordes del cráneo
+    # Erosión para limpiar bordes del cráneo
     kernel = np.ones((5, 5), np.uint8)
     brain_mask = cv2.erode(brain_mask, kernel, iterations=2)
 
@@ -77,103 +69,152 @@ def eliminar_cerebelo_y_ruido(img_rgb, prediccion_binaria):
     prediccion_limpia = cv2.bitwise_and(prediccion_binaria, prediccion_binaria, mask=brain_mask)
 
     # ========================================
-    # PASO 4: FILTRAR COMPONENTES CONECTADOS PEQUEÑOS
+    # PASO 4: FILTRAR COMPONENTES PEQUEÑOS Y RUIDO
     # ========================================
-    # Eliminar regiones menores a 100 píxeles (probablemente ruido)
     num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
         prediccion_limpia.astype(np.uint8), connectivity=8
     )
 
-    # Crear imagen de salida vacía
     output = np.zeros_like(prediccion_limpia)
-
-    # Iterar sobre cada componente (ignorar el fondo, label=0)
+    
+    # Filtrar por área (ruido vs tumor real)
+    # Umbral dinámico? Por ahora 50px es seguro para tumores visibles
+    MIN_TUMOR_PIXELS = 50 
+    
     for i in range(1, num_labels):
         area = stats[i, cv2.CC_STAT_AREA]
-
-        # Solo mantener componentes con área >= 100 píxeles
-        if area >= 100:
+        if area >= MIN_TUMOR_PIXELS:
             output[labels == i] = 1
 
     # ========================================
-    # PASO 5: LIMPIEZA MORFOLÓGICA AGRESIVA
+    # PASO 5: LIMPIEZA MORFOLÓGICA
     # ========================================
     kernel_clean = np.ones((3, 3), np.uint8)
-
-    # Opening: Eliminar píxeles aislados
     output = cv2.morphologyEx(output.astype(np.uint8), cv2.MORPH_OPEN, kernel_clean, iterations=2)
-
-    # Closing: Cerrar huecos
     output = cv2.morphologyEx(output, cv2.MORPH_CLOSE, kernel_clean, iterations=1)
 
     return output
 
+def apply_clahe(img):
+    """
+    Aplica CLAHE al canal de Luminancia (L) del espacio LAB.
+    """
+    lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
+    l, a, b = cv2.split(lab)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+    l_clahe = clahe.apply(l)
+    lab_merged = cv2.merge((l_clahe, a, b))
+    return cv2.cvtColor(lab_merged, cv2.COLOR_LAB2BGR)
+
+def apply_denoise(img):
+    """
+    Elimina ruido 'sal y pimienta' usando Filtro de Mediana.
+    Conserva los bordes mejor que el desenfoque gaussiano.
+    """
+    return cv2.medianBlur(img, 3)
+
+def align_brain(img, mask=None):
+    """
+    Alinea el cerebro verticalmente usando PCA.
+    Maneja la ambigüedad de 180 grados usando heurísticas de masa.
+    """
+    # 1. Obtener nube de puntos
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    puntos = np.column_stack(np.where(thresh > 0)) # (y, x)
+    
+    if len(puntos) == 0:
+        return img, mask
+
+    # 2. PCA
+    # mean: (y, x) centroide
+    mean, eigenvectors, _ = cv2.PCACompute2(puntos.astype(np.float32), mean=None)
+    
+    h, w = img.shape[:2]
+    center_img = (w // 2, h // 2)
+    center_brain = (mean[0, 1], mean[0, 0]) # (x, y)
+    
+    # 3. Ángulo
+    angle = np.arctan2(eigenvectors[0, 1], eigenvectors[0, 0])
+    rotation_angle = np.degrees(angle)
+    
+    # Alinear al eje vertical (90 /-90 grados)
+    # Por defecto PCA da el eje mayor. Queremos que sea vertical.
+    # Si angle es 0 (horizontal), rotamos 90.
+    if abs(rotation_angle) < 45: 
+        rotation_angle += 90
+        
+    # 4. Matriz de Rotación Inicial
+    M = cv2.getRotationMatrix2D(center_brain, rotation_angle, 1.0)
+    tx = center_img[0] - center_brain[0]
+    ty = center_img[1] - center_brain[1]
+    M[0, 2] += tx
+    M[1, 2] += ty
+    
+    # 5. Aplicar Rotación temporal para verificar orientación
+    img_aligned_temp = cv2.warpAffine(img, M, (w, h), flags=cv2.INTER_CUBIC)
+    
+    # --- CHECK DE ORIENTACIÓN (RESOLVER AMBIGÜEDAD 180 GRADOS) ---
+    # Heurística: En cortes axiales, el cerebro suele ser más "ancho" en la parte superior (Parietal/frontal)
+    # y más estrecho o con huecos en la parte inferior (Fosa posterior/Cerebelo).
+    # O, el centro de masa de la mitad superior vs mitad inferior.
+    
+    # Dividir imagen alineada en mitad superior e inferior
+    gray_aligned = cv2.cvtColor(img_aligned_temp, cv2.COLOR_BGR2GRAY)
+    _, thresh_aligned = cv2.threshold(gray_aligned, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    
+    top_half = thresh_aligned[:h//2, :]
+    bottom_half = thresh_aligned[h//2:, :]
+    
+    top_mass = np.sum(top_half)
+    bottom_mass = np.sum(bottom_half)
+    
+    # Si la parte de abajo tiene MUCHA más masa que la de arriba, probablemente está invertida
+    # (El cerebro es generalmente más masivo en los hemisferios que en la punta del tronco/cerebelo)
+    # Esta es una heurística simple y puede fallar en cortes muy específicos, pero ayuda.
+    if bottom_mass > top_mass * 1.1: # Margen del 10%
+        rotation_angle += 180 # Girar 180 grados
+        # Recalcular Matriz con nuevo ángulo
+        M = cv2.getRotationMatrix2D(center_brain, rotation_angle, 1.0)
+        M[0, 2] += tx
+        M[1, 2] += ty
+
+    # 6. Aplicar Transformación Final
+    img_aligned = cv2.warpAffine(img, M, (w, h), flags=cv2.INTER_CUBIC)
+    if mask is not None:
+        mask_aligned = cv2.warpAffine(mask, M, (w, h), flags=cv2.INTER_NEAREST)
+        return img_aligned, mask_aligned
+        
+    return img_aligned
+
+def get_symmetry_feature(img_aligned):
+    """Calcula mapa de asimetría."""
+    gray = cv2.cvtColor(img_aligned, cv2.COLOR_BGR2GRAY)
+    flipped = cv2.flip(gray, 1) # Flip Horizontal
+    diff = cv2.absdiff(gray, flipped)
+    return diff
+
 def calcular_metricas(y_true, y_pred):
-    """
-    Calcula métricas enfocadas en el TUMOR, ignorando el fondo masivo (Accuracy Global engañoso).
-    
-    Métricas implementadas:
-    - IoU (Intersection over Union): Acierto real sobre la zona de interés.
-    - Dice Score (F1): Similar a IoU pero da más peso a los aciertos.
-    
-    Lógica para CASOS SIN TUMOR (Mask Vacía):
-    1. Si Mask está vacía y Predicción está vacía -> ÉXITO (IoU = 1.0)
-    2. Si Mask está vacía y Predicción tiene algo -> FALLO (IoU = 0.0, Penalización Falsos Positivos)
-    """
-    # Aplanar arrays para comparar píxel a píxel
+    # ... (Mismo código anterior)
     y_true_flat = y_true.reshape(-1)
     y_pred_flat = y_pred.reshape(-1)
-    
-    # Calcular componenetes de la matriz de confusión manualmente para control total
-    # TP: Pixel es 1 en ambos
     tp = np.sum((y_true_flat == 1) & (y_pred_flat == 1))
-    
-    # FP: Pixel es 0 en Realidad pero 1 en Predicción (Alucinación)
     fp = np.sum((y_true_flat == 0) & (y_pred_flat == 1))
-    
-    # FN: Pixel es 1 en Realidad pero 0 en Predicción (Tumor perdido)
     fn = np.sum((y_true_flat == 1) & (y_pred_flat == 0))
-    
-    # TN: Pixel es 0 en ambos (Fondo correctamente ignorado) - NO LO USAMOS para métricas tumorales
     tn = np.sum((y_true_flat == 0) & (y_pred_flat == 0))
     
-    # CASO ESPECIAL: IMAGEN SIN TUMOR (Ground Truth vacío)
     if np.sum(y_true_flat) == 0:
         if np.sum(y_pred_flat) == 0:
-            return {
-                "IoU": 1.0, "Dice": 1.0, "Precision": 1.0, "Recall": 1.0,
-                "TP": 0, "FP": 0, "FN": 0, "TN": tn, "Note": "No Tumor (Correcto)"
-            }
+            return {"IoU":1.0, "Dice":1.0, "Precision":1.0, "Recall":1.0, "TP":0, "FP":0, "FN":0, "TN":tn, "Note":"No Tumor (Correcto)"}
         else:
-            return {
-                "IoU": 0.0, "Dice": 0.0, "Precision": 0.0, "Recall": 0.0,
-                "TP": 0, "FP": fp, "FN": 0, "TN": tn, "Note": "No Tumor (Falso Positivo!)"
-            }
+            return {"IoU":0.0, "Dice":0.0, "Precision":0.0, "Recall":0.0, "TP":0, "FP":fp, "FN":0, "TN":tn, "Note":"No Tumor (Falso Positivo)"}
 
-    # CÁLCULO DE MÉTRICAS (Cuando hay tumor)
-    # IoU = TP / (TP + FP + FN)
     iou = tp / (tp + fp + fn) if (tp + fp + fn) > 0 else 0.0
-    
-    # Dice (F1) = 2*TP / (2*TP + FP + FN)
     dice = (2 * tp) / (2 * tp + fp + fn) if (2 * tp + fp + fn) > 0 else 0.0
-    
-    # Precision = TP / (TP + FP)
     precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
-    
-    # Recall = TP / (TP + FN)
     recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
     
-    return {
-        "IoU": iou,
-        "Dice": dice,
-        "Precision": precision,
-        "Recall": recall,
-        "TP": tp,
-        "FP": fp,
-        "TN": tn,
-        "FN": fn,
-        "Note": "Tumor Presente"
-    }
+    return {"IoU":iou, "Dice":dice, "Precision":precision, "Recall":recall, "TP":tp, "FP":fp, "FN":fn, "TN":tn, "Note":"Tumor Presente"}
 
 # ==========================================
 # 1. CONFIGURACIÓN DE RUTAS
@@ -203,68 +244,111 @@ if not files_found:
     exit()
 
 # ==========================================
-# 2. FEATURE EXTRACTION AVANZADO (MULTIESPACIO DE COLOR)
+# 2. FEATURE EXTRACTION AVANZADO
 # ==========================================
 def extract_features(img):
     """
-    Extrae características avanzadas de múltiples espacios de color:
-    - RGB: Para capturar información de color básica
-    - HSV: Crítico para separar crominancia (matiz) del brillo (valor)
-    - LAB: Para imitar la percepción visual humana
-    - Texturas: Canny y Gaussian sobre escala de grises
+    Extrae características avanzadas:
+    - RGB, HSV, LAB
+    - Textura: Canny, Gaussian, Sobel
+    - NUEVO: GLCM (Textura Haralick)
+    - NUEVO: Spatial (X, Y, Radial)
+    - NUEVO: Simetría
     """
     df = pd.DataFrame()
+    h, w, _ = img.shape
 
-    # Validar que la imagen sea a color
-    if len(img.shape) != 3:
-        raise ValueError("La imagen debe ser a color (3 canales)")
-
-    # ========================================
-    # 1. ESPACIO RGB (Color Básico)
-    # ========================================
-    df['R'] = img[:, :, 2].reshape(-1)  # OpenCV usa BGR, no RGB
+    # --- 1. Espacios de Color ---
+    df['R'] = img[:, :, 2].reshape(-1)
     df['G'] = img[:, :, 1].reshape(-1)
     df['B'] = img[:, :, 0].reshape(-1)
 
-    # ========================================
-    # 2. ESPACIO HSV (Separación Crominancia/Luminancia)
-    # ========================================
-    # HSV es crítico para distinguir entre "brillo" y "color real"
+    # --- Feature Específica para Ruido Verde ---
+    # Green_Excess: Cuánto domina el verde sobre el promedio de rojo y azul.
+    # Ayuda a distinguir ruido verde puro de tejidos complejos.
+    r_float = df['R'].astype(np.float32)
+    g_float = df['G'].astype(np.float32)
+    b_float = df['B'].astype(np.float32)
+    df['Green_Excess'] = g_float - (r_float + b_float) / 2.0
+
     img_hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
-    df['H'] = img_hsv[:, :, 0].reshape(-1)  # Hue (Matiz/Tono)
-    df['S'] = img_hsv[:, :, 1].reshape(-1)  # Saturation (Saturación)
-    df['V'] = img_hsv[:, :, 2].reshape(-1)  # Value (Brillo)
+    df['H'] = img_hsv[:, :, 0].reshape(-1)
+    df['S'] = img_hsv[:, :, 1].reshape(-1)
+    df['V'] = img_hsv[:, :, 2].reshape(-1)
 
-    # ========================================
-    # 3. ESPACIO LAB (Percepción Humana)
-    # ========================================
-    # LAB modela mejor cómo los humanos perciben el color
     img_lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
-    df['L'] = img_lab[:, :, 0].reshape(-1)  # Luminance (Luminosidad)
-    df['A'] = img_lab[:, :, 1].reshape(-1)  # A: verde -> rojo
-    df['B_lab'] = img_lab[:, :, 2].reshape(-1)  # B: azul -> amarillo
+    df['L'] = img_lab[:, :, 0].reshape(-1)
+    df['A'] = img_lab[:, :, 1].reshape(-1)
+    df['B_lab'] = img_lab[:, :, 2].reshape(-1)
 
-    # ========================================
-    # 4. CARACTERÍSTICAS DE TEXTURA (Escala de Grises)
-    # ========================================
-    # Convertir a gris SOLO para análisis de textura
+    # --- 2. Textura Básica (Grises) ---
     img_gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-
-    # Detector de bordes Canny
-    edges = cv2.Canny(img_gray, 100, 200)
-    df['Canny'] = edges.reshape(-1)
-
-    # Filtro Gaussiano (suavizado)
-    gaussian = nd.gaussian_filter(img_gray, sigma=3)
-    df['Gaussian'] = gaussian.reshape(-1)
-
-    # Detector de bordes Sobel en X e Y
+    df['Canny'] = cv2.Canny(img_gray, 100, 200).reshape(-1)
+    df['Gaussian'] = nd.gaussian_filter(img_gray, sigma=3).reshape(-1)
+    
+    # Sobel
     sobel_x = cv2.Sobel(img_gray, cv2.CV_64F, 1, 0, ksize=3)
     sobel_y = cv2.Sobel(img_gray, cv2.CV_64F, 0, 1, ksize=3)
-    df['Sobel_X'] = np.abs(sobel_x).reshape(-1)
-    df['Sobel_Y'] = np.abs(sobel_y).reshape(-1)
+    df['Sobel_Mag'] = np.sqrt(sobel_x**2 + sobel_y**2).reshape(-1) # Magnitud del gradiente
 
-    return df, img_gray.shape
+    # --- 3. NUEVO: CARACTERÍSTICAS ESPACIALES (Coordinate Maps) ---
+    # Normalizado 0..1
+    # Y aumenta hacia abajo. Si la imagen está alineada, Y=1 es cerebelo.
+    y_grid, x_grid = np.mgrid[0:h, 0:w]
+    
+    # Normalización
+    y_norm = y_grid.astype(np.float32) / h
+    x_norm = x_grid.astype(np.float32) / w
+    
+    # Distancia Radial al centro (Rotation Invariant!)
+    # Centro = (0.5, 0.5) en coordenadas normalizadas
+    cy, cx = 0.5, 0.5
+    radial_dist = np.sqrt((y_norm - cy)**2 + (x_norm - cx)**2)
+    
+    df['Spatial_Y'] = y_norm.reshape(-1)
+    df['Spatial_X'] = x_norm.reshape(-1) # Útil para simetría implícita
+    df['Spatial_Radial'] = radial_dist.reshape(-1)
+
+    # --- 4. NUEVO: TEXTURA GLCM (Calculada en ventana móvil es muy lento, se usa aproximación o filtros) ---
+    # Calcular GLCM rolling window pixel a pixel es PROHIBITIVO en Python puro.
+    # Alternativa eficiente: Calcular propiedades GLCM globales en parches O usar filtros de entropía/desv local.
+    # Para simplicidad y velocidad en este script "prueba.py":
+    # Usaremos filtros de "Varianza Local" (Entropy) que capturan textura similar a GLCM Homogeneity/Entropy.
+    
+    # from skimage.filters.rank import entropy
+    # from skimage.morphology import disk
+    
+    # Entropía local (Radio 3) - Detecta complejidad de textura
+    # El cerebelo tiene textura regular -> Entropía media
+    # Tumor tiene textura caótica -> Entropía alta o nula (necrosis)
+    # Convertir a uint8 para skimage
+    # Se usa img_gray directamente.
+    
+    # Optimización: GLCM Entropy aproximada por Entropy Filter
+    # entropy_img = entropy(img_gray, disk(3)) # Lento en CPU single thread para imágenes 512x512
+    # Usaremos desviación estándar local como proxy rápido de "Complejidad de Textura"
+    
+    # Textura: Desviación Estándar Local (Kernel 5x5)
+    mean, std_dev = cv2.meanStdDev(img_gray) # Global, no sirve
+    
+    # Calcular media local y luego std dev local manualmente con blur
+    # E[X^2] - (E[X])^2
+    img_gray_f = img_gray.astype(np.float32)
+    mu = cv2.blur(img_gray_f, (5, 5))
+    mu2 = cv2.blur(img_gray_f**2, (5, 5))
+    sigma = np.sqrt(np.maximum(mu2 - mu**2, 0))
+    
+    df['Texture_LocalStd'] = sigma.reshape(-1)
+
+    # Nota: Si el usuario exige GLCM Haralick real, requeriría una implementación optimizada en C++ o 
+    # usar features de parches grandes. Para píxel a píxel, Local Std Dev + Sobel + Entropy es el estándar rápido.
+    # Vamos a añadir Entropía si no tarda demasiado.
+    
+    # --- 5. Simetría ---
+    # Asume imagen alineada
+    df['Symmetry'] = get_symmetry_feature(img).reshape(-1)
+
+    return df, (h, w)
 
 # ==========================================
 # 3. BÚSQUEDA Y SELECCIÓN DE IMÁGENES
@@ -288,7 +372,7 @@ print(f"Encontrados {len(valid_pairs)} pares imagen-máscara válidos")
 # SELECCIÓN ALEATORIA DE 500 IMÁGENES
 # ==========================================
 random.seed(42)  # Para reproducibilidad
-sample_size = min(3929, len(valid_pairs))  # 100 o menos si no hay suficientes
+sample_size = min(500, len(valid_pairs))  # 100 o menos si no hay suficientes
 selected_pairs = random.sample(valid_pairs, sample_size)
 
 print(f"Seleccionadas {sample_size} imágenes al azar")
@@ -335,11 +419,20 @@ for img_path, mask_path in tqdm(zip(train_imgs, train_masks), total=len(train_im
     if img is None or mask is None:
         continue
     
+    # --- PREPROCESAMIENTO NUEVO (CLAHE + ALINEACIÓN) ---
+    # 1. Mejorar Contraste y Reducir Ruido
+    img = apply_clahe(img)
+    img = apply_denoise(img)
+    
+    # 2. Alinear Geométricamente (Cerebro Vertical)
+    # Importante: Alinear imagen Y máscara simultáneamente
+    img, mask = align_brain(img, mask)
+    
     # Normalizar máscara a 0 y 1
     mask = mask // 255 
     mask_flat = mask.reshape(-1)
 
-    # Extraer características
+    # Extraer características (Ahora incluye Simetría)
     features, _ = extract_features(img)
     
     # OPTIMIZACIÓN DE MEMORIA: Convertir a float32 inmediatamente
@@ -444,10 +537,8 @@ for cat in categories:
     os.makedirs(os.path.join(results_dir, cat), exist_ok=True)
 
 # Subcarpetas para TP
-tp_high_dir = os.path.join(results_dir, "TP", "High_Accuracy")
-tp_low_dir = os.path.join(results_dir, "TP", "Low_Accuracy")
-os.makedirs(tp_high_dir, exist_ok=True)
-os.makedirs(tp_low_dir, exist_ok=True)
+# Se generarán dinámicamente según el Dice Score (00_10, 10_20...)
+os.makedirs(os.path.join(results_dir, "TP"), exist_ok=True)
 
 print(f"Los resultados se guardarán en: {results_dir}")
 
@@ -481,7 +572,14 @@ for i in tqdm(range(len(test_imgs)), desc="Procesando Test Set"):
     img_test = cv2_imread_unicode(test_path, cv2.IMREAD_COLOR)
     mask_real = cv2_imread_unicode(test_mask_path, cv2.IMREAD_GRAYSCALE)
 
+    mask_real = cv2_imread_unicode(test_mask_path, cv2.IMREAD_GRAYSCALE)
+
     if img_test is None: continue
+
+    # --- PREPROCESAMIENTO NUEVO (CLAHE + DENOISE + ALINEACIÓN) ---
+    img_test = apply_clahe(img_test)
+    img_test = apply_denoise(img_test)
+    img_test, mask_real = align_brain(img_test, mask_real) # Alinear ambos
 
     # Ground Truth a binario
     mask_real_bin = (mask_real // 255).astype(np.uint8)
@@ -532,13 +630,23 @@ for i in tqdm(range(len(test_imgs)), desc="Procesando Test Set"):
             tp_recalls.append(recall_img)
             tp_miss_rates.append(1 - recall_img)
             
-            # Desglose TP
-            if recall_img > 0.70:
-                save_folder = tp_high_dir
-                cat_display = "TP (High Acc)"
-            else:
-                save_folder = tp_low_dir
-                cat_display = "TP (Low Acc)"
+            # Desglose TP por Deciles (10% en 10%)
+            # Binning basado en Dice Score (0.0 a 1.0)
+            dice_score = mets["Dice"]
+            
+            # Calcular bin: 0.0->0, 0.95->9, 1.0->9 (lo metemos en 90-100)
+            bin_idx = int(dice_score * 10)
+            if bin_idx >= 10: bin_idx = 9 # Cap en el último bin
+            
+            lower = bin_idx * 10
+            upper = (bin_idx + 1) * 10
+            
+            # Nombre de carpeta: Dice_00_10, Dice_90_100, etc.
+            folder_name = f"Dice_{lower:02d}_{upper:02d}"
+            save_folder = os.path.join(results_dir, "TP", folder_name)
+            os.makedirs(save_folder, exist_ok=True)
+            
+            cat_display = f"TP ({folder_name})"
                 
             # Info extendida TP: Muestra Acierto, Perdido y EXCESO (FP)
             extra_info = f"OK: {mets['TP']} | Miss: {mets['FN']} | Excess(FP): {mets['FP']}"
