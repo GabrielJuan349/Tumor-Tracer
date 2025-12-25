@@ -54,6 +54,8 @@ import time                  # Medición de tiempos
 import gc                    # Gestión de memoria (liberación manual)
 import shutil                # Operaciones de carpetas
 import datetime              # Timestamp para logs
+import joblib                # Persistencia de modelos (Save/Load)
+from collections import defaultdict # Para agrupar metricas por paciente
 
 # --- Análisis de Datos ---
 import pandas as pd          # DataFrame para features (21 columnas × N píxeles)
@@ -68,7 +70,8 @@ from sklearn.ensemble import RandomForestClassifier  # Modelo principal
 from sklearn.model_selection import (
     train_test_split,        # Split 80/20 train/test
     cross_validate,          # K-Fold con múltiples métricas
-    KFold                    # Generador de folds
+    KFold,                   # Generador de folds
+    GroupShuffleSplit        # Split respetando grupos (pacientes)
 )
 from sklearn.metrics import (
     accuracy_score,          # Métrica general (no ideal para segmentación)
@@ -81,6 +84,9 @@ from sklearn.metrics import (
 import matplotlib            # Control de backend (Agg para headless)
 matplotlib.use('Agg')        # Sin ventanas emergentes (estabilidad en Windows/Kaggle)
 import matplotlib.pyplot as plt
+import matplotlib.pyplot as plt
+# from mpl_toolkits.mplot3d import Axes3D # Ya no se usa para 3D interactivo
+import plotly.graph_objects as go # Para plots 3D interactivos
 
 # --- Progress Bars ---
 from tqdm import tqdm        # Barras de progreso para loops largos
@@ -89,7 +95,7 @@ from tqdm import tqdm        # Barras de progreso para loops largos
 import warnings
 warnings.filterwarnings('ignore', category=UserWarning)  # Suprimir warnings de sklearn
 
-print("✅ Imports cargados correctamente")
+print("[INFO] Imports cargados correctamente")
 print(f"   - OpenCV: {cv2.__version__}")
 print(f"   - NumPy:  {np.__version__}")
 print(f"   - scikit-learn: {__import__('sklearn').__version__}")
@@ -117,11 +123,12 @@ RF_MAX_DEPTH = 30
 RF_CLASS_WEIGHT = {0: 1, 1: 1.5} # Peso 1.5 a Tumor para priorizar sensibilidad sin disparar FPs
 SUBSAMPLE_RATIO = 3  # Ratio 1 pixel tumor : 3 pixeles fondo
 CV_FOLDS = 7
-NUM_IMAGES = 300
+NUM_IMAGES = 4000
+MODEL_FILENAME = "rf_model.joblib"
 
 PROJECT_ROOT = os.getcwd()
 
-print(f"✅ Proyecto raíz establecido en: {PROJECT_ROOT}")
+print(f"[INFO] Proyecto raíz establecido en: {PROJECT_ROOT}")
 
 
 # 📂 Preparación y Migración del Dataset
@@ -226,9 +233,148 @@ def limpiar_directorio_resultados(path):
         os.makedirs(os.path.join(path, cat), exist_ok=True)
     
     # Subcarpetas TP por calidad se crean dinámicamente durante inferencia
-    print(f"✅ Directorio de resultados preparado: {path}")
+    print(f"[INFO] Directorio de resultados preparado: {path}")
 
-def log_experiment_to_md(params, metrics, timings, cv_full, feat_imps, filename="experiment_history.md"):
+def generar_plot_3d_paciente(pid, slices_data, save_path):
+    """
+    Genera una visualización 3D interactiva (Malla de Alambre/Contornos) de los bordes del tumor usando Plotly.
+    
+    Args:
+        pid (str): ID del Paciente.
+        slices_data (list): Lista de tuplas (slice_idx, mask_gt, mask_pred).
+        save_path (str): Ruta donde guardar el archivo .html.
+    """
+    # Listas para coordenadas, insertaremos None para separar trazos (slices/contornos distintos)
+    gt_x, gt_y, gt_z = [], [], []
+    pred_x, pred_y, pred_z = [], [], []
+    
+    has_data = False
+
+    # Procesar cada slice
+    for slice_idx, m_gt, m_pred in slices_data:
+        # --- Ground Truth ---
+        contours_gt, _ = cv2.findContours(m_gt, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        for cnt in contours_gt:
+            has_data = True
+            # Cerrar el contorno añadiendo el primer punto al final
+            cnt = np.concatenate((cnt, [cnt[0]]), axis=0)
+            
+            for point in cnt:
+                gt_x.append(point[0][0])
+                gt_y.append(-point[0][1]) # Invertir Y
+                gt_z.append(slice_idx)
+            
+            # Separador para que no una con el siguiente contorno
+            gt_x.append(None)
+            gt_y.append(None)
+            gt_z.append(None)
+                
+        # --- Predicción ---
+        contours_pred, _ = cv2.findContours(m_pred, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        for cnt in contours_pred:
+            has_data = True
+            cnt = np.concatenate((cnt, [cnt[0]]), axis=0)
+            
+            for point in cnt:
+                pred_x.append(point[0][0])
+                pred_y.append(-point[0][1])
+                pred_z.append(slice_idx)
+                
+            pred_x.append(None)
+            pred_y.append(None)
+            pred_z.append(None)
+                
+    if not has_data:
+        return
+
+    fig = go.Figure()
+
+    # Trace GT (Verde)
+    if gt_x:
+        fig.add_trace(go.Scatter3d(
+            x=gt_x, y=gt_y, z=gt_z,
+            mode='lines',
+            line=dict(color='green', width=4),
+            name='Ground Truth',
+            opacity=0.7
+        ))
+        
+    # Trace Pred (Rojo)
+    if pred_x:
+        fig.add_trace(go.Scatter3d(
+            x=pred_x, y=pred_y, z=pred_z,
+            mode='lines',
+            line=dict(color='red', width=4),
+            name='Predicción AI',
+            opacity=0.7
+        ))
+        
+    fig.update_layout(
+        title=f"Reconstrucción 3D Tumor (Contornos) - {pid}",
+        scene=dict(
+            xaxis_title='X',
+            yaxis_title='Y (Invertido)',
+            zaxis_title='Slice (Z)'
+        ),
+        margin=dict(l=0, r=0, b=0, t=40)
+    )
+    
+    # Guardar como HTML interactivo
+    fig.write_html(save_path)
+
+def preparar_dataset_pacientes_temp(origen, destino, n_pacientes):
+    """
+    Crea un dataset temporal con un subconjunto de pacientes.
+    1. Borra 'destino' si existe.
+    2. Selecciona 'n_pacientes' al azar de 'origen'.
+    3. Copia todas las imágenes de esos pacientes a 'destino' (estructura plana).
+    
+    Returns:
+        list[str]: Lista de IDs de pacientes seleccionados.
+    """
+    if os.path.exists(destino):
+        shutil.rmtree(destino)
+    os.makedirs(destino)
+    
+    # Listar carpetas de pacientes (cada carpeta es un paciente)
+    # Estructura: kaggle_3m/TCGA_CS_4941_19960909/
+    patient_folders = glob.glob(os.path.join(origen, "*"))
+    patient_folders = [p for p in patient_folders if os.path.isdir(p)]
+    
+    if len(patient_folders) == 0:
+        raise ValueError(f"No se encontraron carpetas de pacientes en {origen}")
+        
+    # Seleccionar N pacientes
+    if n_pacientes == 'all' or int(n_pacientes) >= len(patient_folders):
+        selected_folders = patient_folders
+        print(f"   -> Usando TODOS los pacientes ({len(selected_folders)}).")
+    else:
+        selected_folders = random.sample(patient_folders, int(n_pacientes))
+        print(f"   -> Seleccionados {len(selected_folders)} pacientes al azar.")
+        
+    selected_pids = []
+    count_imgs = 0
+    
+    print("   -> Copiando archivos al dataset temporal...")
+    for folder in tqdm(selected_folders, desc="Preparando Dataset Temp"):
+        # Extraer ID paciente (basename de la carpeta)
+        # Ojo: A veces el nombre de carpeta es TCGA_CS_4941_19960909, pero el ID base es TCGA_CS_4941.
+        # Asumiremos la carpeta como unidad "paciente/estudio".
+        folder_name = os.path.basename(folder)
+        selected_pids.append(folder_name)
+        
+        # Buscar .tif dentro
+        imgs = glob.glob(os.path.join(folder, "*.tif"))
+        for img_path in imgs:
+            dst = os.path.join(destino, os.path.basename(img_path))
+            shutil.copy2(img_path, dst)
+            count_imgs += 1
+            
+    print(f"   -> Dataset temporal listo en: {destino}")
+    print(f"   -> Total imágenes: {count_imgs}")
+    return selected_pids
+
+def log_experiment_to_md(params, metrics, timings, cv_full, feat_imps, patient_metrics=None, filename="experiment_history.md"):
     """Guarda los resultados del experimento en un archivo Markdown persistente."""
     path = os.path.join(PROJECT_ROOT, filename)
     mode = 'a' if os.path.exists(path) else 'w'
@@ -288,6 +434,15 @@ def log_experiment_to_md(params, metrics, timings, cv_full, feat_imps, filename=
         f.write(f"- **Calidad de Segmentación (Dice):** `{metrics['Dice']:.2%}`\n")
         f.write(f"- **Limpieza de Ruido:** Se eliminaron **{metrics['NoiseReduced']:,}** píxeles de falsas alarmas durante el post-proceso.\n")
         
+        if patient_metrics:
+            f.write(f"\n### 5. Resultados por Paciente\n")
+            f.write(f"| Paciente | TP | FP | FN | TN | Dice |\n")
+            f.write(f"|----------|----|----|----|----|------|\n")
+            # Ordenar por Dice descendente
+            sorted_pats = sorted(patient_metrics.items(), key=lambda x: x[1]['Dice'], reverse=True)
+            for pid, m in sorted_pats:
+                f.write(f"| {pid} | {m['TP']} | {m['FP']} | {m['FN']} | {m['TN']} | {m['Dice']:.2%} |\n")
+
         f.write("\n" + "="*60 + "\n\n")
     
     print(f"\n[HISTORIAL] Resultados detallados guardados en: {filename}")
@@ -534,340 +689,216 @@ def calcular_metricas(y_true, y_pred):
 if __name__ == "__main__":
     timings = {}
 
-    print("\n=== INICIANDO PIPELINE DE DETECCIÓN DE TUMORES ===")
-    t_start_icd = time.time()
+    print("\n=== TUMOR TRACER AI - MENU PRINCIPAL ===")
+    print("1. Entrenar Modelo Nuevo (Dataset Plano)")
+    print("2. Analizar Pacientes (Usar Modelo Pre-entrenado)")
+    
+    try:
+        mode_input = input("   > Seleccione opción [1/2]: ").strip()
+    except EOFError:
+        mode_input = "1"
 
-    # --- 1. Buscar Datos ---
-    print("\n[1] Buscando Dataset...")
-    search_paths = [
-        os.path.join(PROJECT_ROOT, "data", "dataset_plano"),
-        os.path.join(PROJECT_ROOT, "data", "kaggle_3m")
-    ]
-
-    files_found = []
-    for p in search_paths:
-        if os.path.exists(p):
-            curr = glob.glob(os.path.join(p, '**', '*_mask.tif'), recursive=True)
-            if curr:
-                files_found = curr
-                print(f"    -> Encontrado: {p} ({len(curr)} máscaras)")
-                break
-
-    if not files_found:
-        print("[ERROR] No se encontraron datos. Revise las rutas.")
-        # Detener ejecución si no hay datos (en notebook lanzamos error)
-        raise FileNotFoundError("No se encontraron imágenes en las rutas especificadas.")
-
-    # Preparar pares validos
-    valid_pairs = []
-    for mask_p in files_found:
-        img_p = mask_p.replace('_mask.tif', '.tif')
-        if os.path.exists(img_p):
-            valid_pairs.append((img_p, mask_p))
-
-    # Selección Aleatoria
-    sample_size = min(NUM_IMAGES, len(valid_pairs))
-    random.seed(RANDOM_STATE)
-    selected = random.sample(valid_pairs, sample_size)
-    print(f"    -> Seleccionadas {len(selected)} imágenes para el proceso.")
-
-    # Split Train/Test
-    train_pairs, test_pairs = train_test_split(selected, test_size=0.2, random_state=RANDOM_STATE)
-    print(f"    -> Train: {len(train_pairs)} | Test: {len(test_pairs)}")
-
-    timings['inicializacion_carga_datos'] = time.time() - t_start_icd
-
-
-    # ### 6.2 Extracción de Características (Entrenamiento)
-    # Etapa intensiva: Preproceso -> Features -> Subsampling -> Consolidación
-
-    print(f"\n[2] Extracción de Características (Train)...")
-    t_start_extract = time.time()
-    X_train_list, Y_train_list = [], []
-
-    for img_p, mask_p in tqdm(train_pairs, desc="Procesando Train"):
-        img = cv2_imread_unicode(img_p)
-        mask = cv2_imread_unicode(mask_p, cv2.IMREAD_GRAYSCALE)
-        if img is None or mask is None: continue
-
-        # Pipeline Preproceso
-        img = apply_clahe(img)
-        img = apply_denoise(img)
-        img, mask = align_brain(img, mask)
-
-        mask = (mask // 255).reshape(-1)
-        features, _ = extract_features(img)
-        features = features.astype(np.float32)
-
-        # Subsampling estrategico
-        idx_tumor = np.where(mask == 1)[0]
-        idx_backg = np.where(mask == 0)[0]
+    # ==========================================
+    # MODO 1: ENTRENAMIENTO
+    # ==========================================
+    if mode_input == "1":
+        print("\n--- INICIANDO MODO ENTRENAMIENTO ---")
+        t_start_train_mode = time.time()
         
-        counts_t = len(idx_tumor)
-        counts_b = len(idx_backg)
+        # 1. Carga de Datos (Dataset Plano)
+        search_path = os.path.join(PROJECT_ROOT, "data", "dataset_plano")
+        print(f"[1] Buscando imágenes en: {search_path}")
         
-        sample_indices = []
-        if counts_t > 0:
-            # Tomar todo el tumor y 3x de fondo
-            needed_b = min(counts_b, counts_t * SUBSAMPLE_RATIO)
-            if needed_b > 0:
-                sample_indices = np.concatenate([
-                    idx_tumor, 
-                    np.random.choice(idx_backg, needed_b, replace=False)
-                ])
-            else:
-                sample_indices = idx_tumor
-        else:
-            # Imagen sana: tomar pequeña muestra representativa
-            sample_indices = np.random.choice(idx_backg, min(counts_b, 2000), replace=False)
-
-        X_train_list.append(features.iloc[sample_indices])
-        Y_train_list.append(mask[sample_indices])
-
-    time_extract = time.time() - t_start_extract
-    timings['extraction'] = time_extract
-    print(f"    -> Tiempo Extracción: {time_extract:.1f}s")
-
-    # Consolidar
-    t_start_consolidate = time.time()
-    X_train = pd.concat(X_train_list)
-    Y_train = np.concatenate(Y_train_list)
-    del X_train_list, Y_train_list
-    gc.collect()
-
-    timings['consolidacion'] = time.time() - t_start_consolidate
-    print(f"    -> Dataset Final: {len(X_train):,} píxeles.")
-    print(f"    -> Distribución: Tumor={np.sum(Y_train==1):,}, Fondo={np.sum(Y_train==0):,}")
-
-
-    # ### 6.3 Validación Cruzada (Cross-Validation)
-    # K-Fold (7 folds) para evaluar estabilidad.
-
-    print(f"\n[3] Validación Cruzada (K-Fold={CV_FOLDS})...")
-    t_start_cv = time.time()
-
-    # Definir modelo
-    rf_model = RandomForestClassifier(
-        n_estimators=RF_ESTIMATORS,
-        max_depth=RF_MAX_DEPTH,
-        class_weight=RF_CLASS_WEIGHT,
-        n_jobs=-1,
-        random_state=RANDOM_STATE,
-        verbose=0
-    )
-
-    # Muestra reducida para CV rapido (opcional, para velocidad)
-    cv_idx = np.random.choice(len(Y_train), min(100000, len(Y_train)), replace=False)
-    kfold = KFold(n_splits=CV_FOLDS, shuffle=True, random_state=RANDOM_STATE)
-    scoring_metrics = ['f1', 'precision', 'recall']
-
-    # Ejecutar CV
-    scores = cross_validate(rf_model, X_train.iloc[cv_idx], Y_train[cv_idx], cv=kfold, scoring=scoring_metrics, n_jobs=1)
-
-    print(f"    -> Resultados por Fold:")
-    print(f"       {'Fold':<5} {'F1':<10} {'Precision':<10} {'Recall':<10}")
-    print(f"       {'-'*35}")
-
-    for i in range(CV_FOLDS):
-        f1 = scores['test_f1'][i]
-        prec = scores['test_precision'][i]
-        rec = scores['test_recall'][i]
-        print(f"       {i+1:<5d} {f1:<10.4f} {prec:<10.4f} {rec:<10.4f}")
-        
-    print(f"       {'-'*35}")
-    print(f"    -> PROMEDIOS:")
-    print(f"       F1-Score  : {scores['test_f1'].mean():.4f} (+/- {scores['test_f1'].std()*2:.4f})")
-    print(f"       Precision : {scores['test_precision'].mean():.4f}")
-    print(f"       Recall    : {scores['test_recall'].mean():.4f}")
-
-    stability = scores['test_f1'].std() < 0.05
-    print(f"    -> Estado: {'✅ ESTABLE' if stability else '⚠️ INESTABLE'}")
-
-    timings['cv'] = time.time() - t_start_cv
-
-
-    # ### 6.4 Entrenamiento del Modelo Final
-    # Entrenar con TODOS los datos.
-
-    print(f"\n[4] Entrenando Modelo Final...")
-    t_start_train = time.time()
-    rf_model.fit(X_train, Y_train)
-    time_train = time.time() - t_start_train
-    timings['train'] = time_train
-
-    # Importancias
-    imps = rf_model.feature_importances_
-    feat_names = X_train.columns
-    sorted_idx = np.argsort(imps)[::-1]
-    feature_importance_list = []
-
-    print("\n    -> IMPORTANCIA DE CARACTERÍSTICAS (Todas):")
-    print(f"       {'Ranking':<8} {'Feature':<20} {'Importancia':<10}")
-    print(f"       {'-'*40}")
-    for i in range(len(feat_names)):
-        idx = sorted_idx[i]
-        name = feat_names[idx]
-        val = imps[idx]
-        feature_importance_list.append((name, val))
-        print(f"       {i+1:<8d} {name:<20s} : {val:.4f}")
-
-
-    # ### 6.5 Inferencia y Evaluación (Test Set)
-    # Evaluación ciega en el 20% reservado.
-
-    print(f"\n[5] Evaluando en Test Set ({len(test_pairs)} imágenes)...")
-    results_dir = os.path.join(PROJECT_ROOT, "results")
-    limpiar_directorio_resultados(results_dir)
-
-    global_metrics = {"TP":0, "FP":0, "FN":0, "TN":0}
-    img_counts = {"TP":0, "TN":0, "FP":0, "FN":0}
-    tp_qualities = [] # Dice scores
-    metrics_raw = {"TP":0, "FP":0, "FN":0} # Antes de limpiar
-    total_cleaned_pixels = 0
-
-    t_start_inf = time.time()
-    for img_p, mask_p in tqdm(test_pairs, desc="Inferencia"):
-
-        img_orig = cv2_imread_unicode(img_p)
-        mask_orig = cv2_imread_unicode(mask_p, cv2.IMREAD_GRAYSCALE)
-        fname = os.path.basename(img_p)
-        
-        if img_orig is None: continue
-
-        # Preproceso Test
-        img = apply_clahe(img_orig)
-        img = apply_denoise(img)
-        img, mask = align_brain(img, mask_orig)
-        mask_bin = (mask // 255).astype(np.uint8)
-
-        # Prediccion
-        feat_df, (h, w) = extract_features(img)
-        pred_flat = rf_model.predict(feat_df)
-        pred_map = pred_flat.reshape(h, w).astype(np.uint8)
-        
-        # Guardar metricas RAW
-        m_raw = calcular_metricas(mask_bin, pred_map)
-        metrics_raw["FP"] += m_raw["FP"]
-
-        # Limpieza
-        clean_map = eliminar_cerebelo_y_ruido(img, pred_map)
-        
-        # Metricas FINALES
-        m_final = calcular_metricas(mask_bin, clean_map)
-        total_cleaned_pixels += (m_raw["FP"] - m_final["FP"])
-        
-        # Acumular globales
-        for k in global_metrics: global_metrics[k] += m_final[k]
-        
-        # Clasificar Imagen
-        has_tumor = np.sum(mask_bin) > 0
-        detected = np.sum(clean_map) > 0
-        cat = "TN"
-        if has_tumor and detected: cat = "TP"
-        elif has_tumor and not detected: cat = "FN"
-        elif not has_tumor and detected: cat = "FP"
-        
-        img_counts[cat] += 1
-        
-        # Guardar resultados visuales
-        save_subdir = cat
-        extra_txt = ""
-        
-        if cat == "TP":
-            dice = m_final["Dice"]
-            tp_qualities.append(dice)
-            decile = min(int(dice * 10), 9) * 10
-            save_subdir = os.path.join("TP", f"Dice_{decile:02d}_{decile+10:02d}")
-            os.makedirs(os.path.join(results_dir, save_subdir), exist_ok=True)
-            extra_txt = f"Dice: {dice:.2%}"
-        elif cat == "FP":
-            extra_txt = f"Ruido: {m_final['FP']} px"
+        files_found = glob.glob(os.path.join(search_path, '**', '*_mask.tif'), recursive=True)
+        if not files_found:
+            raise FileNotFoundError("No se encontraron imágenes en dataset_plano.")
             
-        # Generar Plot
-        fig, axs = plt.subplots(1, 3, figsize=(12, 4))
-        fig.suptitle(f"[{cat}] {fname} | {extra_txt}")
-        axs[0].imshow(cv2.cvtColor(img, cv2.COLOR_BGR2RGB)); axs[0].set_title("Input (Aligned)")
-        axs[1].imshow(mask_bin, cmap='gray'); axs[1].set_title("Ground Truth")
-        axs[2].imshow(clean_map, cmap='Reds'); axs[2].set_title("Predicción AI")
-        for ax in axs: ax.axis('off')
+        valid_pairs = []
+        for mask_p in files_found:
+            img_p = mask_p.replace('_mask.tif', '.tif')
+            if os.path.exists(img_p):
+                valid_pairs.append((img_p, mask_p))
+                
+        # Subsampling
+        if len(valid_pairs) > NUM_IMAGES:
+            random.seed(RANDOM_STATE)
+            train_pairs = random.sample(valid_pairs, NUM_IMAGES)
+        else:
+            train_pairs = valid_pairs
+            
+        print(f"    -> Imágenes para entrenamiento: {len(train_pairs)}")
         
-        plt.tight_layout()
-        plt.savefig(os.path.join(results_dir, save_subdir, f"res_{fname}.png"))
-        plt.close()
+        # 2. Extracción de Features
+        print(f"\n[2] Extrayendo Características y Entrenando...")
+        t_start_extract = time.time()
+        X_train_list, Y_train_list = [], []
 
-    time_inf = time.time() - t_start_inf
-    timings['inference'] = time_inf
-    timings['total'] = sum(timings.values())
+        for img_p, mask_p in tqdm(train_pairs, desc="Procesando Train"):
+            img = cv2_imread_unicode(img_p)
+            mask = cv2_imread_unicode(mask_p, cv2.IMREAD_GRAYSCALE)
+            if img is None or mask is None: continue
 
+            img = apply_clahe(img)
+            img = apply_denoise(img)
+            img, mask = align_brain(img, mask)
 
-    # ### 6.6 Reporte Final y Logs
+            mask = (mask // 255).reshape(-1)
+            features, _ = extract_features(img)
+            features = features.astype(np.float32)
 
-    print("\n" + "="*60)
-    print("REPORTE FINAL DE EJECUCIÓN")
-    print("="*60)
+            idx_tumor = np.where(mask == 1)[0]
+            idx_backg = np.where(mask == 0)[0]
+            
+            counts_t = len(idx_tumor)
+            counts_b = len(idx_backg)
+            
+            if counts_t > 0:
+                needed_b = min(counts_b, counts_t * SUBSAMPLE_RATIO)
+                sample_indices = np.concatenate([idx_tumor, np.random.choice(idx_backg, needed_b, replace=False)])
+            else:
+                sample_indices = np.random.choice(idx_backg, min(counts_b, 2000), replace=False)
 
-    # 1. Imagenes
-    n_test = len(test_pairs)
-    print("1. CLASIFICACIÓN DE IMÁGENES")
-    print(f"   Total: {n_test}")
-    print(f"   ✅ TP: {img_counts['TP']:3d} ({img_counts['TP']/n_test:6.2%})")
-    print(f"   ✅ TN: {img_counts['TN']:3d} ({img_counts['TN']/n_test:6.2%})")
-    print(f"   ❌ FP: {img_counts['FP']:3d} ({img_counts['FP']/n_test:6.2%})")
-    print(f"   ❌ FN: {img_counts['FN']:3d} ({img_counts['FN']/n_test:6.2%})")
+            X_train_list.append(features.iloc[sample_indices])
+            Y_train_list.append(mask[sample_indices])
 
-    # 2. Calidad
-    print("\n2. CALIDAD DE SEGMENTACIÓN (Casos TP)")
-    avg_dice = np.mean(tp_qualities) if tp_qualities else 0.0
-    if tp_qualities:
-        print(f"   Dice Promedio: {avg_dice:.2%}")
-    else:
-        print("   (No hubo casos TP)")
-
-    # 3. Pixeles
-    print("\n3. PRECISIÓN QUIRÚRGICA (Píxeles)")
-    tot_p = global_metrics["TP"] + global_metrics["FN"]
-    tot_det = global_metrics["TP"] + global_metrics["FP"]
-
-    sens = global_metrics["TP"] / tot_p if tot_p > 0 else 0
-    conf = global_metrics["TP"] / tot_det if tot_det > 0 else 0
-
-    print(f"   Sensibilidad (Recall): {sens:6.2%}")
-    print(f"   Confianza (Precision): {conf:6.2%}")
-    print(f"   Ruido Eliminado:       {total_cleaned_pixels:,} píxeles")
-
-    # 4. Tiempos
-    print("\n4. TIEMPOS DE EJECUCIÓN")
-    print(f"   Carga de Datos:     {timings.get('inicializacion_carga_datos',0):.2f} s")
-    print(f"   Extracción (Train): {timings.get('extraction',0):.2f} s")
-    print(f"   Consolidación:      {timings.get('consolidacion',0):.2f} s")
-    print(f"   Cross-Validation:   {timings.get('cv',0):.2f} s")
-    print(f"   Entrenamiento:      {timings.get('train',0):.2f} s")
-    print(f"   Inferencia (Test):  {timings.get('inference',0):.2f} s")
-    print(f"   TOTAL SCRIPT:       {timings.get('total',0):.2f} s")
-
-    # --- LOG A MARKDOWN ---
-    params = {
-        'n_images': len(selected),
-        'n_train': len(train_pairs),
-        'n_test': len(test_pairs),
-        'rf_est': RF_ESTIMATORS,
-        'rf_depth': RF_MAX_DEPTH,
-        'rf_weight': str(RF_CLASS_WEIGHT)
-    }
-
-    metrics = {
-        'TP': img_counts['TP'], 'TN': img_counts['TN'], 'FP': img_counts['FP'], 'FN': img_counts['FN'],
-        'Recall': sens, 'Precision': conf, 'Dice': avg_dice,
-        'NoiseReduced': total_cleaned_pixels,
-        'cv_f1_mean': scores['test_f1'].mean(),
-        'cv_f1_std': scores['test_f1'].std(),
-        'cv_prec_mean': scores['test_precision'].mean(),
-        'cv_rec_mean': scores['test_recall'].mean()
-    }
-
-    log_experiment_to_md(params, metrics, timings, scores, feature_importance_list)
+        X_train = pd.concat(X_train_list)
+        Y_train = np.concatenate(Y_train_list)
+        del X_train_list, Y_train_list
+        gc.collect()
         
-    print("\n[FIN] Resultados guardados en 'results/'")
+        timings['extraction'] = time.time() - t_start_extract
+        print(f"    -> Dataset Construido: {len(X_train):,} píxeles.")
+
+        # 3. Entrenar Modelo
+        print(f"\n[3] Entrenando Random Forest...")
+        rf_model = RandomForestClassifier(
+            n_estimators=RF_ESTIMATORS,
+            max_depth=RF_MAX_DEPTH,
+            class_weight=RF_CLASS_WEIGHT,
+            n_jobs=-1,
+            random_state=RANDOM_STATE,
+            verbose=0
+        )
+        rf_model.fit(X_train, Y_train)
+        
+        # 4. Guardar Modelo
+        print(f"\n[4] Guardando Modelo en '{MODEL_FILENAME}'...")
+        joblib.dump(rf_model, os.path.join(PROJECT_ROOT, MODEL_FILENAME))
+        print("    -> [OK] Modelo guardado correctamente.")
+        print(f"    -> Tiempo Total Entrenamiento: {time.time() - t_start_train_mode:.1f}s")
+
+
+    # ==========================================
+    # MODO 2: INFERENCIA / ANALISIS
+    # ==========================================
+    elif mode_input == "2":
+        model_path = os.path.join(PROJECT_ROOT, MODEL_FILENAME)
+        if not os.path.exists(model_path):
+            print(f"\n❌ ERROR: No se encontró el modelo '{MODEL_FILENAME}'.")
+            print("   Por favor, ejecute la opción 1 primero para entrenar.")
+            sys.exit(1)
+            
+        print("\n--- INICIANDO MODO ANÁLISIS DE PACIENTES ---")
+        
+        # Cargar Modelo
+        print(f"[1] Cargando modelo desde '{MODEL_FILENAME}'...")
+        rf_model = joblib.load(model_path)
+        print("    -> [OK] Modelo cargado.")
+        
+        # Seleccionar Pacientes
+        print("\n[2] Selección de Pacientes")
+        try:
+            n_pat = input("   > ¿Cuántos pacientes analizar? (N o 'all'): ").strip()
+            if n_pat.lower() != 'all': _ = int(n_pat)
+        except:
+            n_pat = "5"
+            
+        orig_kaggle = os.path.join(PROJECT_ROOT, "data", "kaggle_3m")
+        temp_kaggle = os.path.join(PROJECT_ROOT, "data", "dataset_temp_pacientes")
+        
+        # Preparar datos
+        preparar_dataset_pacientes_temp(orig_kaggle, temp_kaggle, n_pat)
+        
+        # Buscar archivos
+        search_files = glob.glob(os.path.join(temp_kaggle, '*.tif'))
+        # Filtrar solo mascaras para iterar
+        mask_files = [f for f in search_files if '_mask.tif' in f]
+        test_pairs = []
+        for m in mask_files:
+            img = m.replace('_mask.tif', '.tif')
+            test_pairs.append((img, m))
+            
+        print(f"    -> Analizando {len(test_pairs)} imágenes...")
+        
+        # Inferencia
+        results_dir = os.path.join(PROJECT_ROOT, "results")
+        limpiar_directorio_resultados(results_dir)
+        
+        patient_3d_data = defaultdict(list)
+        patient_metrics = defaultdict(lambda: {"TP":0, "FP":0, "FN":0, "TN":0, "DiceAcc":0.0, "CountTP":0})
+        
+        print(f"\n[3] Ejecutando Inferencia...")
+        for img_p, mask_p in tqdm(test_pairs, desc="Inferencia"):
+            img_orig = cv2_imread_unicode(img_p)
+            mask_orig = cv2_imread_unicode(mask_p, cv2.IMREAD_GRAYSCALE)
+            if img_orig is None: continue
+            
+            fname = os.path.basename(img_p)
+            parts = fname.split('_')
+            pid = "_".join(parts[:3])
+            try: slice_idx = int(parts[-1].split('.')[0])
+            except: slice_idx = 0
+            
+            # Preproceso
+            img = apply_clahe(img_orig)
+            img = apply_denoise(img)
+            img, mask = align_brain(img, mask_orig)
+            mask_bin = (mask // 255).astype(np.uint8)
+
+            # Prediccion
+            feat_df, (h, w) = extract_features(img)
+            pred_flat = rf_model.predict(feat_df)
+            pred_map = pred_flat.reshape(h, w).astype(np.uint8)
+            
+            # Limpieza
+            clean_map = eliminar_cerebelo_y_ruido(img, pred_map)
+            
+            # Metricas
+            m = calcular_metricas(mask_bin, clean_map)
+            
+            # Acumular
+            for k in ["TP", "FP", "FN", "TN"]:
+                patient_metrics[pid][k] += m[k]
+                
+            if np.sum(mask_bin) > 0 or np.sum(clean_map) > 0:
+                patient_3d_data[pid].append((slice_idx, mask_bin, clean_map))
+                
+            # Guardar visual (Solo ejemplos o todos?)
+            # Guardaremos todo para mantener consistencia con anterior
+            has_tumor = np.sum(mask_bin) > 0
+            detected = np.sum(clean_map) > 0
+            cat = "TP" if (has_tumor and detected) else "TN"
+            if has_tumor and not detected: cat = "FN"
+            if not has_tumor and detected: cat = "FP"
+            
+            save_subdir = os.path.join("ByPatient", pid, cat)
+            os.makedirs(os.path.join(results_dir, save_subdir), exist_ok=True)
+            
+            fig, axs = plt.subplots(1, 3, figsize=(12, 4))
+            axs[0].imshow(cv2.cvtColor(img, cv2.COLOR_BGR2RGB)); axs[0].set_title("Input")
+            axs[1].imshow(mask_bin, cmap='gray'); axs[1].set_title("GT")
+            axs[2].imshow(clean_map, cmap='Reds'); axs[2].set_title("AI Pred")
+            plt.savefig(os.path.join(results_dir, save_subdir, f"res_{fname}.png"))
+            plt.close()
+
+        # Generar 3D
+        print("\n[4] Generando 3D Interactivo...")
+        for pid, slices in tqdm(patient_3d_data.items(), desc="Rendering 3D"):
+            slices.sort(key=lambda x: x[0])
+            save_path = os.path.join(results_dir, "ByPatient", pid, "3d_reconstruction.html")
+            generar_plot_3d_paciente(pid, slices, save_path)
+            
+        print("\n[INFO] Análisis completado. Resultados en 'results/'.")
 
 
 # 🔮 Conclusiones y Líneas de Futuro
