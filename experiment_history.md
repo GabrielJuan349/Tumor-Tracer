@@ -290,3 +290,61 @@
 
 ============================================================
 
+## 🧪 Prueba: 2025-12-25 16:28:42
+### 1. Configuración del Experimento
+- **Dataset:** 300 imágenes (Train: 240, Test: 60)
+- **Random Forest:** `Estimators=100`, `Depth=30`, `ClassWeight={0: 1, 1: 1.5}`
+- **Tiempos:** Extrac=8.7s | CV=20.1s | Train=55.0s | Inf=31.4s | **Total=115.7s**
+
+### 2. Validación Cruzada (K=7) - Estabilidad
+| Fold | F1-Score | Precision | Recall |
+|------|----------|-----------|--------|
+| 1 | 0.9074 | 0.9297 | 0.8863 |
+| 2 | 0.9148 | 0.9281 | 0.9018 |
+| 3 | 0.9114 | 0.9268 | 0.8965 |
+| 4 | 0.9063 | 0.9202 | 0.8928 |
+| 5 | 0.9109 | 0.9296 | 0.8930 |
+| 6 | 0.9117 | 0.9269 | 0.8971 |
+| 7 | 0.9070 | 0.9246 | 0.8900 |
+| **Promedio** | **0.9099** ± 0.0058 | 0.9266 | 0.8939 |
+
+### 3. Importancia de Características (Top Influencias)
+| Ranking | Característica | Importancia | Descripción |
+|:-------:|----------------|-------------|-------------|
+| 1 | **Green_Excess** | 0.1575 | Índice de 'Verdosidad' (G - (R+B)/2) |
+| 2 | **A** | 0.1539 | Canal A (LAB) - Rojo/Verde |
+| 3 | **Green_Texture** | 0.1029 | Interacción Verde * Textura |
+| 4 | B_lab | 0.0808 | Canal B (LAB) - Azul/Amarillo |
+| 5 | Spatial_Radial | 0.0712 | Distancia al centro del cerebro |
+| 6 | G | 0.0523 | - |
+| 7 | Gaussian | 0.0518 | - |
+| 8 | L | 0.0433 | - |
+| 9 | Spatial_X | 0.0428 | - |
+| 10 | Spatial_Y | 0.0349 | - |
+| 11 | B | 0.0325 | - |
+| 12 | H | 0.0314 | - |
+| 13 | S | 0.0311 | - |
+| 14 | R | 0.0291 | - |
+| 15 | Texture_LocalStd | 0.0280 | Complejidad/Rugosidad local |
+| 16 | V | 0.0231 | - |
+| 17 | Symmetry | 0.0170 | Diferencia entre hemisferios |
+| 18 | Sobel_Mag | 0.0154 | - |
+| 19 | Canny | 0.0010 | - |
+
+### 4. Resultados Finales (Test Set - 60 imágenes)
+#### 📊 Clasificación de Imágenes
+- ✅ **TP (Detectados):** 20 imágenes - *El modelo encontró el tumor correctamente.*
+- ✅ **TN (Sanos):** 21 imágenes - *El modelo confirmó que estaba sano.*
+- ❌ **FP (Falsas Alarmas):** 16 imágenes - *El modelo vio tumor donde no había.*
+- ❌ **FN (Perdidos):** 3 imágenes - *El modelo NO vio el tumor existente.*
+
+#### 🎯 Precisión Quirúrgica (Píxel a Píxel)
+- **Sensibilidad (Recall):** `61.06%`
+  > De todo el tejido tumoral real, el modelo detectó este porcentaje.
+- **Confianza (Precision):** `45.05%`
+  > De todo lo que el modelo marcó en rojo, este porcentaje era realmente tumor.
+- **Calidad de Segmentación (Dice):** `66.10%`
+- **Limpieza de Ruido:** Se eliminaron **34,505** píxeles de falsas alarmas durante el post-proceso.
+
+============================================================
+
